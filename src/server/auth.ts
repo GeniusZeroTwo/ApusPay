@@ -6,8 +6,8 @@ import { getRuntimeEnv } from "./env";
 import { AppError } from "./errors";
 import { randomToken, secureEqual, sha256 } from "./security";
 
-export const SESSION_COOKIE = "alimpay_session";
-export const CSRF_COOKIE = "alimpay_csrf";
+export const SESSION_COOKIE = "apuspay_session";
+export const CSRF_COOKIE = "apuspay_csrf";
 
 export interface AdminUser {
   id: string;
@@ -143,11 +143,13 @@ export function setAuthCookies(c: Parameters<typeof setCookie>[0], session: Retu
 export function clearAuthCookies(c: Parameters<typeof deleteCookie>[0]) {
   deleteCookie(c, SESSION_COOKIE, { path: "/" });
   deleteCookie(c, CSRF_COOKIE, { path: "/" });
+  deleteCookie(c, "alimpay_session", { path: "/" });
+  deleteCookie(c, "alimpay_csrf", { path: "/" });
 }
 
 export function authMiddleware(database: AppDatabase): MiddlewareHandler<{ Variables: AuthVariables }> {
   return async (c, next) => {
-    const token = getCookie(c, SESSION_COOKIE) ?? "";
+    const token = getCookie(c, SESSION_COOKIE) ?? getCookie(c, "alimpay_session") ?? "";
     if (!token) throw new AppError(401, "AUTH_REQUIRED", "请先登录");
     const now = new Date().toISOString();
     database.query("DELETE FROM sessions WHERE expires_at <= ?").run(now);
@@ -161,7 +163,7 @@ export function authMiddleware(database: AppDatabase): MiddlewareHandler<{ Varia
     if (!["GET", "HEAD", "OPTIONS"].includes(c.req.method)) {
       assertOriginAllowed(c.req.url, c.req.header("origin") || c.req.header("referer"), database);
       const csrfHeader = c.req.header("x-csrf-token") ?? "";
-      const csrfCookie = getCookie(c, CSRF_COOKIE) ?? "";
+      const csrfCookie = getCookie(c, CSRF_COOKIE) ?? getCookie(c, "alimpay_csrf") ?? "";
       if (!csrfHeader || !csrfCookie || !secureEqual(csrfHeader, csrfCookie)) {
         throw new AppError(403, "CSRF_REJECTED", "CSRF 校验失败，请刷新页面后重试");
       }

@@ -127,7 +127,7 @@ export function SystemPage() {
           <CardContent className="space-y-4 text-sm leading-6 text-muted">
             <div className="flex gap-3"><HardDrive className="mt-0.5 size-5 shrink-0 text-primary" /><p>备份整个 data 目录，至少包含 SQLite 主库、WAL/SHM、上传经营码和自动生成的 .master-key。在线备份优先使用 SQLite backup 命令。</p></div>
             <div className="flex gap-3"><LockKeyhole className="mt-0.5 size-5 shrink-0 text-primary" /><p>如通过环境变量显式设置 APP_MASTER_KEY，请另行备份该值。无论采用哪种方式，遗失或更换主密钥后，加密私钥都无法恢复。</p></div>
-            <pre className="overflow-x-auto rounded-md border bg-foreground/[0.025] p-3 font-mono text-xs text-foreground">sqlite3 data/alimpay.sqlite ".backup 'backup.sqlite'"</pre>
+            <pre className="overflow-x-auto rounded-md border bg-foreground/[0.025] p-3 font-mono text-xs text-foreground">sqlite3 data/apuspay.sqlite ".backup 'backup.sqlite'"</pre>
           </CardContent>
         </Card>
       </div>

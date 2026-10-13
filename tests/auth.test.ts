@@ -28,7 +28,7 @@ describe("admin session and CSRF", () => {
     const payload = JSON.stringify({ v1_enabled: false, transfer_link_layer: 2, payment_poll_interval_seconds: 2 });
     expect((await app.request("http://localhost/admin-api/settings")).status).toBe(401);
 
-    const baseHeaders = { cookie: "alimpay_session=session-token; alimpay_csrf=csrf-token", "content-type": "application/json" };
+    const baseHeaders = { cookie: "apuspay_session=session-token; apuspay_csrf=csrf-token", "content-type": "application/json" };
     expect((await app.request("http://localhost/admin-api/settings", { method: "PUT", headers: baseHeaders, body: payload })).status).toBe(403);
     expect((await app.request("http://localhost/admin-api/settings", { method: "PUT", headers: { ...baseHeaders, "x-csrf-token": "csrf-token", origin: "https://evil.example" }, body: payload })).status).toBe(403);
     const accepted = await app.request("http://localhost/admin-api/settings", { method: "PUT", headers: { ...baseHeaders, "x-csrf-token": "csrf-token", origin: "http://localhost" }, body: payload });
@@ -88,15 +88,15 @@ describe("admin session and CSRF", () => {
     expect(loginBody.csrf_token).toBeTruthy();
 
     const setCookies = loginRes.headers.get("set-cookie") ?? "";
-    expect(setCookies).toContain("alimpay_session=");
-    expect(setCookies).toContain("alimpay_csrf=");
+    expect(setCookies).toContain("apuspay_session=");
+    expect(setCookies).toContain("apuspay_csrf=");
 
     // Extract cookies for subsequent requests
-    const sessionMatch = setCookies.match(/alimpay_session=([^;]+)/);
-    const csrfMatch = setCookies.match(/alimpay_csrf=([^;]+)/);
+    const sessionMatch = setCookies.match(/apuspay_session=([^;]+)/);
+    const csrfMatch = setCookies.match(/apuspay_csrf=([^;]+)/);
     expect(sessionMatch).toBeTruthy();
     expect(csrfMatch).toBeTruthy();
-    const cookieHeader = `alimpay_session=${sessionMatch![1]}; alimpay_csrf=${csrfMatch![1]}`;
+    const cookieHeader = `apuspay_session=${sessionMatch![1]}; apuspay_csrf=${csrfMatch![1]}`;
 
     // 3. GET /admin-api/me works
     const meRes = await app.request("http://localhost/admin-api/me", {

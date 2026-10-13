@@ -261,7 +261,7 @@ export function CheckoutPage() {
     <main className="min-h-screen px-4 py-8 sm:py-12 bg-slate-50 dark:bg-slate-950">
       <div className="mx-auto max-w-4xl">
         <header className="mb-6 flex items-center justify-center gap-2 text-sm font-semibold text-slate-700 dark:text-slate-300">
-          <WalletCards className="size-5 text-primary" />AllPay 安全收银台
+          <WalletCards className="size-5 text-primary" />ApusPay 安全收银台
         </header>
 
         <div className="grid gap-6 md:grid-cols-[1fr_320px]">

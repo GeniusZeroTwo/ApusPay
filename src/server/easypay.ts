@@ -408,7 +408,7 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
         return c.json({
           code: 0,
           status: "pending_auth",
-          msg: "AllPay Hook 接口就绪（已启用 Token 保护，请求时请附带 ?token=xxx 或 X-Hook-Token 请求头）",
+          msg: "ApusPay Hook 接口就绪（已启用 Token 保护，请求时请附带 ?token=xxx 或 X-Hook-Token 请求头）",
           authenticated: false,
         });
       }
@@ -423,7 +423,7 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
       return c.json({
         code: 1,
         status: "ok",
-        msg: "AllPay Hook 接口就绪，Token 鉴权通过",
+        msg: "ApusPay Hook 接口就绪，Token 鉴权通过",
         authenticated: true,
       });
     }
@@ -431,7 +431,7 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
     return c.json({
       code: 1,
       status: "ok",
-      msg: "AllPay Hook 接口就绪（当前未配置 wxpay_hook_token，无需鉴权）",
+      msg: "ApusPay Hook 接口就绪（当前未配置 wxpay_hook_token，无需鉴权）",
       authenticated: true,
     });
   });

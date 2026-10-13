@@ -48,7 +48,7 @@ export function SetupPage() {
         <section className="max-w-xl">
           <div className="mb-8 flex items-center gap-3">
             <span className="flex size-10 items-center justify-center rounded-md bg-primary text-background"><WalletCards className="size-5" /></span>
-            <div><div className="font-semibold">AliMPay</div><div className="text-sm text-muted">Bun 单商户收款网关</div></div>
+            <div><div className="font-semibold">ApusPay</div><div className="text-sm text-muted">现代化聚合支付网关</div></div>
           </div>
           <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">先完成三项基础配置</h1>
           <p className="mt-4 text-base leading-7 text-muted">初始化会创建固定管理员 admin、V1 MD5 凭据和 V2 平台密钥。支付宝应用密钥与经营码稍后在后台配置。</p>

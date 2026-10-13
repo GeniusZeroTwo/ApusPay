@@ -5,7 +5,7 @@
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="clr-namespace:WeChatHook"
         mc:Ignorable="d" Loaded="Window_Loaded" WindowStartupLocation="CenterScreen" Closing="Window_Closing"
-        Title="SweetCheckout Hook" Height="300" Width="460" MinHeight="240" MinWidth="300">
+        Title="ApusPay Hook" Height="300" Width="460" MinHeight="240" MinWidth="300">
     <Grid>
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>

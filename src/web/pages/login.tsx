@@ -39,7 +39,7 @@ export function LoginPage() {
       <div className="w-full max-w-sm">
         <div className="mb-6 flex items-center justify-center gap-3">
           <span className="flex size-9 items-center justify-center rounded-md bg-primary text-background"><WalletCards className="size-4" /></span>
-          <div><div className="font-semibold">AliMPay</div><div className="text-xs text-muted">支付运维控制台</div></div>
+          <div><div className="font-semibold">ApusPay</div><div className="text-xs text-muted">聚合支付控制台</div></div>
         </div>
         <Card>
           <CardHeader>

@@ -218,7 +218,7 @@ namespace WeChatHook
 
                                 using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(15) };
                                 var request = new HttpRequestMessage(HttpMethod.Post, targetUri);
-                                request.Headers.Add("User-Agent", "AllPay-Hook/1.0 (Windows NT 10.0; Win64; x64)");
+                                request.Headers.Add("User-Agent", "ApusPay-Hook/1.0 (Windows NT 10.0; Win64; x64)");
                                 request.Headers.Add("Accept", "application/json");
                                 if (!string.IsNullOrWhiteSpace(hookToken))
                                 {

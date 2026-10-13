@@ -18,7 +18,7 @@ export default defineConfig({
     { name: "mobile-chromium", use: { ...devices["Pixel 7"] } },
   ],
   webServer: {
-    command: "bun run build && DATA_DIR=$(mktemp -d /tmp/alimpay-e2e.XXXXXX) NODE_ENV=development PORT=3100 PUBLIC_BASE_URL=http://127.0.0.1:3100 bun start",
+    command: "bun run build && DATA_DIR=$(mktemp -d /tmp/apuspay-e2e.XXXXXX) NODE_ENV=development PORT=3100 PUBLIC_BASE_URL=http://127.0.0.1:3100 bun start",
     url: "http://127.0.0.1:3100/healthz",
     reuseExistingServer: false,
     timeout: 120_000,

@@ -1,8 +1,8 @@
 services:
-  alimpay:
+  apuspay:
     build: .
-    image: alimpay-bun:local
-    container_name: alimpay
+    image: apuspay:local
+    container_name: apuspay
     restart: unless-stopped
     ports:
       - "0.0.0.0:3000:3000"

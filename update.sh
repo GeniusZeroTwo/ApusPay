@@ -2,7 +2,7 @@
 set -e
 
 echo "=========================================="
-echo "          AllPay 服务端一键平滑更新"
+echo "          ApusPay 服务端一键平滑更新"
 echo "=========================================="
 
 cd "$(dirname "$0")"
@@ -23,12 +23,12 @@ elif command -v bun >/dev/null 2>&1; then
     bun install --frozen-lockfile
     bun run build
     echo "--> [3/3] 前端构建完成！"
-    if command -v pm2 >/dev/null 2>&1 && pm2 list | grep -q "allpay"; then
+    if command -v pm2 >/dev/null 2>&1 && (pm2 list | grep -qE "apuspay|allpay"); then
         echo "--> 正在通过 PM2 重载服务..."
-        pm2 reload allpay
+        pm2 reload apuspay 2>/dev/null || pm2 reload allpay
     else
         echo "--> 提示: 若使用 systemctl 或后台进程运行，请执行对应重启命令，例如："
-        echo "    systemctl restart allpay 或 pm2 restart allpay"
+        echo "    systemctl restart apuspay 或 pm2 restart apuspay"
     fi
 else
     echo "--> [提示] 代码已拉取完成，请根据您服务器的实际环境执行构建与重启。"

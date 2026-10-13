@@ -33,8 +33,8 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
       <div className="flex h-16 items-center gap-3 border-b px-5">
         <span className="flex size-8 items-center justify-center rounded-md bg-primary text-background"><WalletCards className="size-4" /></span>
         <div>
-          <div className="text-sm font-semibold">AllPay</div>
-          <div className="text-xs text-muted">聚合易支付网关</div>
+          <div className="text-sm font-semibold">ApusPay</div>
+          <div className="text-xs text-muted">聚合支付网关</div>
         </div>
       </div>
       <nav className="flex-1 space-y-1 p-3" aria-label="后台导航">
@@ -78,7 +78,7 @@ export function AppShell() {
         <SidebarContent />
       </aside>
       <header className="sticky top-0 z-30 flex h-14 items-center justify-between border-b bg-background/95 px-4 lg:hidden">
-        <div className="flex items-center gap-2 text-sm font-semibold"><WalletCards className="size-4 text-primary" />AllPay</div>
+        <div className="flex items-center gap-2 text-sm font-semibold"><WalletCards className="size-4 text-primary" />ApusPay</div>
         <Dialog open={open} onOpenChange={setOpen}>
           <DialogTrigger asChild>
             <Button variant="ghost" size="icon" aria-label="打开导航" title="打开导航"><Menu /></Button>

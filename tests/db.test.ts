@@ -28,7 +28,7 @@ function seedLegacyLayer(path: string, layer: number) {
 
 describe("database settings migrations", () => {
   it("maps the old five-layer numbering to the retained three layers once", () => {
-    directory = mkdtempSync(join(tmpdir(), "alimpay-db-test-"));
+    directory = mkdtempSync(join(tmpdir(), "apuspay-db-test-"));
     const cases: Array<readonly [number, number]> = [[5, 1], [4, 2], [3, 3], [2, 3], [1, 3]];
     for (const [legacy, expected] of cases) {
       const path = join(directory, `legacy-${legacy}.sqlite`);
@@ -45,7 +45,7 @@ describe("database settings migrations", () => {
   });
 
   it("uses the verified HTTPS layer for new databases", () => {
-    directory = mkdtempSync(join(tmpdir(), "alimpay-db-test-"));
+    directory = mkdtempSync(join(tmpdir(), "apuspay-db-test-"));
     const database = createDatabase(join(directory, "fresh.sqlite"));
     opened.push(database);
     expect(getSetting(database, "transfer_link_layer", 0)).toBe(2);

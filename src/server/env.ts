@@ -62,7 +62,11 @@ export function getRuntimeEnv(): RuntimeEnv {
     host: process.env.HOST ?? "0.0.0.0",
     port: Number.isFinite(port) ? port : 3000,
     dataDir,
-    databasePath: resolve(dataDir, "alimpay.sqlite"),
+    databasePath: existsSync(resolve(dataDir, "apuspay.sqlite"))
+      ? resolve(dataDir, "apuspay.sqlite")
+      : existsSync(resolve(dataDir, "alimpay.sqlite"))
+        ? resolve(dataDir, "alimpay.sqlite")
+        : resolve(dataDir, "apuspay.sqlite"),
     uploadDir,
     publicBaseUrl: (process.env.PUBLIC_BASE_URL ?? `http://localhost:${Number.isFinite(port) ? port : 3000}`).replace(/\/$/, ""),
     allowPrivateCallbacks: boolEnv(process.env.ALLOW_PRIVATE_CALLBACKS),

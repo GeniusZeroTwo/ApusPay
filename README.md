@@ -1,6 +1,6 @@
-# AllPay 易支付独立版网关
+# ApusPay (天燕付) 易支付独立版网关
 
-> 纯净、现代、高性能的自部署聚合支付网关。完全兼容易支付（EasyPay）V1 与 V2 协议标准，去除所有 Minecraft 耦合与冗余逻辑，适用于任何电商、发卡系统、会员站点及 SaaS 平台。
+> 纯净、现代、高性能的自部署聚合支付网关（Codename: Strelizia True Apus）。完全兼容易支付（EasyPay）V1 与 V2 协议标准，适用于任何电商、发卡系统、会员站点及 SaaS 平台。
 
 [![Bun](https://img.shields.io/badge/Bun-1.4%2B-black?logo=bun)](https://bun.sh)
 [![React](https://img.shields.io/badge/React-19-blue?logo=react)](https://react.dev)
@@ -129,7 +129,7 @@ bun run check
 ## 📁 目录结构
 
 ```
-allpay/
+apuspay/
   ├── src/
   │   ├── server/           # Hono 后端服务
   │   │   ├── index.ts      # 主入口与生命周期托管
