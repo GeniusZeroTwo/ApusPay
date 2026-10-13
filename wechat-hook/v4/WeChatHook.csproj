@@ -10,7 +10,7 @@
     <Company>MrXiaoM</Company>
     <AssemblyVersion>1.0.0</AssemblyVersion>
     <FileVersion>1.0.0</FileVersion>
-    <RepositoryUrl>https://github.com/MrXiaoM/SweetCheckout</RepositoryUrl>
+    <RepositoryUrl>https://github.com/GeniusZeroTwo/ApusPay</RepositoryUrl>
     <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>
 
