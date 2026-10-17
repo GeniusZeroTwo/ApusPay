@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Data;
 using System.IO;
 using System.Security.Cryptography;
@@ -27,8 +28,67 @@ namespace WeChatHook
             111, 114, 109, 97, 116, 32, 51, 0
         }; // "SQLite format 3\x00" 的字节表示
         private static readonly ZstdNet.Decompressor Zstd = new ZstdNet.Decompressor();
+        private static readonly ConcurrentDictionary<string, DerivedKeys> KeyCache = new();
+
+        internal readonly struct DerivedKeys
+        {
+            public byte[] EncKey { get; init; }
+            public byte[] MacKey { get; init; }
+        }
 
         private DecryptService() { }
+
+        internal static void ClearKeyCache() => KeyCache.Clear();
+
+        /// <summary>
+        /// PBKDF2-SHA512 256000 次只跟盐有关。同一个库的盐不变，派生结果可以一直复用。
+        /// </summary>
+        internal static DerivedKeys GetKeys(string hexKey, byte[] salt)
+        {
+            var cacheKey = hexKey + ":" + Convert.ToHexString(salt);
+            return KeyCache.GetOrAdd(cacheKey, _ =>
+            {
+                var key = HexToBytes(hexKey);
+                if (key.Length != KeySize)
+                    throw new ArgumentException("密钥必须为64字符（32字节）的16进制字符串", nameof(hexKey));
+                var encKey = DeriveEncryptionKey(key, salt);
+                return new DerivedKeys
+                {
+                    EncKey = encKey,
+                    MacKey = DeriveMacKey(encKey, salt),
+                };
+            });
+        }
+
+        /// <summary>
+        /// 把一页密文还原成 4096 字节明文页。HMAC 失败返回 null，调用方保留旧页并稍后重试。
+        /// </summary>
+        internal static byte[]? MaterializePage(byte[] page, DerivedKeys keys, int pageNum, bool skipHmacValidation)
+        {
+            if (IsAllZeros(page)) return new byte[PageSize];
+            try
+            {
+                var segment = DecryptPage(page, keys.EncKey, keys.MacKey, pageNum, skipHmacValidation);
+                if (pageNum != 0) return segment.Length == PageSize ? segment : FitPage(segment);
+                var full = new byte[PageSize];
+                Buffer.BlockCopy(SqliteHeader, 0, full, 0, SqliteHeader.Length);
+                Buffer.BlockCopy(segment, 0, full, SqliteHeader.Length, Math.Min(segment.Length, PageSize - SqliteHeader.Length));
+                return full;
+            }
+            catch (CryptographicException)
+            {
+                return null;
+            }
+        }
+
+        internal static byte[] ReadFileShared(string filePath) => ReadFileBytesSafely(filePath);
+
+        private static byte[] FitPage(byte[] segment)
+        {
+            var padded = new byte[PageSize];
+            Buffer.BlockCopy(segment, 0, padded, 0, Math.Min(segment.Length, PageSize));
+            return padded;
+        }
 
         public static bool ValidateKey(string dbPath, string hexKey)
         {
@@ -45,11 +105,8 @@ namespace WeChatHook
 
                 var salt = new byte[SaltSize];
                 Array.Copy(firstPage, 0, salt, 0, SaltSize);
-
-                var encKey = DeriveEncryptionKey(key, salt);
-                var macKey = DeriveMacKey(encKey, salt);
-
-                return ValidatePageHmac(firstPage, macKey, 0);
+                var keys = GetKeys(hexKey, salt);
+                return ValidatePageHmac(firstPage, keys.MacKey, 0);
             }
             catch
             {
@@ -81,37 +138,14 @@ namespace WeChatHook
                 var totalPages = (int)Math.Ceiling((double)encryptedData.Length / PageSize);
                 var salt = new byte[SaltSize];
                 Array.Copy(encryptedData, 0, salt, 0, SaltSize);
-
-                var encKey = DeriveEncryptionKey(key, salt);
-                var macKey = DeriveMacKey(encKey, salt);
+                var keys = GetKeys(hexKey, salt);
 
                 for (int pageNum = 0; pageNum < totalPages; pageNum++)
                 {
-                    var page = ExtractPage(encryptedData, pageNum);
-
-                    if (IsAllZeros(page))
-                    {
-                        outputStream.Write(page, 0, page.Length);
-                        continue;
-                    }
-
-                    var decryptedPageSegment = DecryptPage(
-                        page, encKey, macKey, pageNum, skipHmacValidation
-                    );
-
-                    byte[] fullPage;
-                    if (pageNum == 0)
-                    {
-                        fullPage = new byte[PageSize];
-                        Array.Copy(SqliteHeader, 0, fullPage, 0, SqliteHeader.Length);
-                        Array.Copy(decryptedPageSegment, 0, fullPage, SqliteHeader.Length, decryptedPageSegment.Length);
-                    }
-                    else
-                    {
-                        fullPage = decryptedPageSegment;
-                    }
-
-                    outputStream.Write(fullPage, 0, fullPage.Length);
+                    var plain = MaterializePage(ExtractPage(encryptedData, pageNum), keys, pageNum, skipHmacValidation);
+                    if (plain == null)
+                        throw new CryptographicException($"页面 {pageNum} HMAC 验证失败（数据篡改或密钥错误）");
+                    outputStream.Write(plain, 0, plain.Length);
                 }
             }
         }

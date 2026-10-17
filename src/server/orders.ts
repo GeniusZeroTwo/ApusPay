@@ -366,6 +366,7 @@ export function markOrderPaidDirectly(
     channelOrderId?: string;
     buyer?: string;
     occurredAt?: string;
+    eventId?: string;
   },
 ): boolean {
   const now = new Date().toISOString();
@@ -404,6 +405,10 @@ export function markOrderPaidDirectly(
       INSERT INTO notification_jobs(id, order_id, status, attempts, max_attempts, next_attempt_at, manual, created_at, updated_at)
       VALUES (?, ?, 'pending', 0, 10, ?, 0, ?, ?)
     `).run(crypto.randomUUID(), current.id, now, now, now);
+
+    if (info.eventId) {
+      database.query("INSERT INTO hook_events(event_id, trade_no, created_at) VALUES (?, ?, ?)").run(info.eventId, current.trade_no, now);
+    }
 
     database.exec("COMMIT");
     return true;

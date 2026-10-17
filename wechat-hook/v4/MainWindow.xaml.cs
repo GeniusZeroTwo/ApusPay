@@ -1,6 +1,7 @@
 using Microsoft.Data.Sqlite;
 using Microsoft.Win32;
 using System.Data;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Http;
@@ -28,6 +29,26 @@ namespace WeChatHook
         private string realDbFolder = "";
         string temp = Environment.CurrentDirectory + "\\.tmp";
         FileSystemWatcher watcher = new FileSystemWatcher();
+        private readonly HttpClient httpClient;
+        private readonly System.Threading.Timer safetyTimer;
+        private readonly SemaphoreSlim exclusive = new(1, 1);
+        private readonly SemaphoreSlim submitGate = new(1, 1);
+        private readonly object scheduleLock = new();
+        private readonly object stateLock = new();
+        private readonly object storageLock = new();
+        private readonly object warnLock = new();
+        private readonly HashSet<string> pending = new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> hotFiles = new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> classified = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, DateTime> lastWarn = new(StringComparer.OrdinalIgnoreCase);
+        private bool flushScheduled;
+        private bool closing;
+        private bool forceRescan;
+        private bool suppressSubmit;
+        private int safetyBusy;
+        private string watchedFolder = "";
+        private const int DebounceMs = 800;
+        private const int SafetyMs = 20_000;
         JsonSerializerOptions serializerOptions = new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
@@ -40,7 +61,6 @@ namespace WeChatHook
             Cache = SqliteCacheMode.Shared,
             Pooling = false,
         }.ToString();
-        private HashSet<string> ProcessingFiles = [], NextProcessFiles = [];
         public MainWindow()
         {
             InitializeComponent();
@@ -49,221 +69,365 @@ namespace WeChatHook
                 System.Net.ServicePointManager.SecurityProtocol |= System.Net.SecurityProtocolType.Tls12 | System.Net.SecurityProtocolType.Tls13;
             }
             catch { }
+            try
+            {
+                Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.BelowNormal;
+            }
+            catch { }
             CloudflareOptimizer.OnLog = (msg) => info(msg);
             CloudflareOptimizer.Start();
-            watcher.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.CreationTime;
+            httpClient = new HttpClient(new SocketsHttpHandler
+            {
+                PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+                ConnectCallback = ConnectSocket,
+            })
+            { Timeout = TimeSpan.FromSeconds(15) };
+            watcher.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.CreationTime | NotifyFilters.Size;
             watcher.IncludeSubdirectories = false;
             watcher.Created += OnFileChanged;
             watcher.Changed += OnFileChanged;
+            safetyTimer = new System.Threading.Timer(_ => { _ = SafetyTick(); }, null, SafetyMs, SafetyMs);
         }
 
-        private async void OnFileChanged(object sender, FileSystemEventArgs e)
+        private void OnFileChanged(object sender, FileSystemEventArgs e)
         {
-            var fi = new FileInfo(e.FullPath);
-            var fileName = fi.Name;
-            if (fi.Exists && (fileName.StartsWith("biz_message_") || fileName.StartsWith("message_")))
-            {
-                if (hexKey == string.Empty) return;
-                // 轻微防抖延迟（60ms），等待系统 WAL 批量落盘，降低热文件争用
-                await Task.Delay(60);
-                if (!fi.Exists) return;
-
-                if (fileName.EndsWith(".db"))
-                {
-                    info($"检测到聊天数据变更 {fi.Name}");
-                    await OnFileChange(fi);
-                }
-                else if (fileName.EndsWith(".db-wal"))
-                {
-                    var baseDbName = fileName.Substring(0, fileName.Length - 4);
-                    var baseDbFile = new FileInfo(Path.Combine(fi.DirectoryName ?? "", baseDbName));
-                    if (baseDbFile.Exists)
-                    {
-                        info($"检测到聊天日志变更 {fileName}");
-                        await OnFileChange(baseDbFile);
-                    }
-                }
-            }
+            var dbPath = ResolveDatabasePath(e.FullPath);
+            if (dbPath == null) return;
+            Schedule(dbPath);
         }
 
-        private async Task OnFileChange(FileInfo fi)
+        private static string? ResolveDatabasePath(string fullPath)
         {
-            var fullPath = fi.FullName;
-            var target = temp + "\\" + fi.Name.Replace(".db", "") + "-" + Guid.NewGuid() + ".db";
-            if (ProcessingFiles.Contains(fullPath))
+            var name = Path.GetFileName(fullPath);
+            string? dbPath = null;
+            if (name.EndsWith(".db-wal", StringComparison.OrdinalIgnoreCase))
+                dbPath = Path.Combine(Path.GetDirectoryName(fullPath) ?? "", name[..^4]);
+            else if (name.EndsWith(".db", StringComparison.OrdinalIgnoreCase))
+                dbPath = fullPath;
+            if (dbPath == null || !IsMessageDatabase(Path.GetFileName(dbPath)) || !File.Exists(dbPath)) return null;
+            return Path.GetFullPath(dbPath);
+        }
+
+        private static bool IsMessageDatabase(string fileName) =>
+            fileName.EndsWith(".db", StringComparison.OrdinalIgnoreCase)
+            && (fileName.StartsWith("message_", StringComparison.OrdinalIgnoreCase)
+                || fileName.StartsWith("biz_message_", StringComparison.OrdinalIgnoreCase));
+
+        private void Schedule(string dbPath)
+        {
+            if (closing || hexKey == string.Empty) return;
+            lock (stateLock)
             {
-                NextProcessFiles.Add(fullPath);
-                return;
+                if (classified.Contains(dbPath) && !hotFiles.Contains(dbPath)) return;
             }
-            ProcessingFiles.Add(fullPath);
-            List<Message> scan;
+            lock (scheduleLock)
+            {
+                pending.Add(dbPath);
+                if (flushScheduled) return;
+                flushScheduled = true;
+            }
+            _ = Task.Run(DrainPending);
+        }
+
+        private async Task DrainPending()
+        {
             try
             {
-                DecryptService.DecryptDatabase(hexKey, fi.FullName, target);
-                scan = await DatabaseService.Scan(target);
-            }
-            catch (Exception ex)
-            {
-                warn($"(文件监听) {ex.Message}");
-                if (NextProcessFiles.Remove(fullPath)) await OnFileChange(fi);
-                return;
+                do
+                {
+                    await Task.Delay(DebounceMs);
+                    if (closing) break;
+                    List<string> batch;
+                    lock (scheduleLock)
+                    {
+                        batch = pending.ToList();
+                        pending.Clear();
+                    }
+                    if (batch.Count == 0) break;
+                    var found = new List<Message>();
+                    await RunExclusive(async () =>
+                    {
+                        foreach (var path in batch)
+                        {
+                            found.AddRange(await ProcessDb(path, queryIfUnchanged: false));
+                        }
+                    });
+                    await SubmitMessages(found);
+                } while (!closing);
             }
             finally
             {
-                ProcessingFiles.Remove(fullPath);
-                DeleteDatabaseFile(target);
-            }
-
-            if (NextProcessFiles.Remove(fullPath))
-            {
-                await OnFileChange(fi);
-            }
-            else
-            {
-                handleMessageSubmit(scan);
+                bool again = false;
+                lock (scheduleLock)
+                {
+                    flushScheduled = false;
+                    if (!closing && pending.Count > 0)
+                    {
+                        flushScheduled = true;
+                        again = true;
+                    }
+                }
+                if (again) _ = Task.Run(DrainPending);
             }
         }
 
-        private void handleMessageSubmit(ICollection<Message> messages, bool submitToBackend = true)
+        private async Task SafetyTick()
         {
-            if (messages.Count == 0) return;
-            lock (storageConnectionString)
+            if (closing || hexKey == string.Empty || realDbFolder == string.Empty) return;
+            if (Interlocked.Exchange(ref safetyBusy, 1) == 1) return;
+            try
             {
-                // 筛选并提交未处理的收款消息到后端
-                var outdate = DateTimeOffset.UtcNow.AddMinutes(-DatabaseService.RecentMinutes);
-                var timestamp = outdate.ToUnixTimeSeconds();
-                try
+                var files = ListCandidateDbs();
+                var found = new List<Message>();
+                await RunExclusive(async () =>
                 {
-                    using var conn = new SqliteConnection(storageConnectionString);
-                    conn.Open();
-                    var list = new List<Message>();
-                    foreach (var item in messages)
+                    foreach (var file in files)
                     {
-                        // 太早的消息不进行处理
-                        if (item.CreateTime <= outdate) continue;
-                        list.Add(item);
-                    }
-                    using var cmd = new SqliteCommand("SELECT * FROM 'handled_sequences' WHERE create_time > $timestamp;", conn);
-                    cmd.Parameters.AddWithValue("$timestamp", timestamp);
-                    var reader = cmd.ExecuteReader();
-                    var handled = new List<string>();
-                    foreach (var item in reader)
-                    {
-                        if (item is not IDataRecord record) continue;
-                        var server_seq = record["server_seq"].ToString();
-                        var sender_id = record["sender_id"].ToString();
-                        if (server_seq == null || sender_id == null) continue;
-                        handled.Add(sender_id + ";" + server_seq);
-                    }
-                    foreach (var message in list)
-                    {
-                        // 已经在数据库里的消息不进行处理
-                        var key = message.SenderId + ";" + message.ServerSequence;
-                        if (handled.Contains(key)) continue;
-                        // 提交为已处理消息
-                        PutHandled(conn, message);
-                        if (!submitToBackend) continue;
-                        info($"提交收款记录到后端: ￥{message.Money}");
-                        // 将消息发送给后端
-                        if (apiUrl != string.Empty)
+                        bool hot, known;
+                        lock (stateLock)
                         {
-                            try
-                            {
-                                var targetUri = BuildTargetUri(apiUrl, hookToken);
-                                var handler = new SocketsHttpHandler
-                                {
-                                    PooledConnectionLifetime = TimeSpan.FromMinutes(5),
-                                    ConnectCallback = async (context, cancellationToken) =>
-                                    {
-                                        var targetHost = context.DnsEndPoint.Host;
-                                        var port = context.DnsEndPoint.Port;
-
-                                        bool isLocalOrIp = IPAddress.TryParse(targetHost, out _) || 
-                                                           targetHost.Equals("localhost", StringComparison.OrdinalIgnoreCase) ||
-                                                           targetHost.EndsWith(".local", StringComparison.OrdinalIgnoreCase);
-
-                                        // 若启用了 Cloudflare 优选且测得了最优 IP（且目标非本地/局域网），优先直连最优节点
-                                        var optimalIp = (CloudflareOptimizer.Enabled && !isLocalOrIp) ? CloudflareOptimizer.OptimalIp : null;
-                                        if (optimalIp != null)
-                                        {
-                                            var socket = new Socket(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
-                                            try
-                                            {
-                                                await socket.ConnectAsync(new IPEndPoint(optimalIp, port), cancellationToken);
-                                                return new NetworkStream(socket, ownsSocket: true);
-                                            }
-                                            catch
-                                            {
-                                                socket.Dispose();
-                                                CloudflareOptimizer.NotifyFailure(optimalIp);
-                                                // 优选节点直连失败后自动平滑退回到标准 DNS 解析
-                                            }
-                                        }
-
-                                        var hostEntry = await Dns.GetHostEntryAsync(targetHost, cancellationToken);
-                                        var entryIp = hostEntry.AddressList.FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetwork) ?? hostEntry.AddressList[0];
-                                        var fallbackSocket = new Socket(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
-                                        try
-                                        {
-                                            await fallbackSocket.ConnectAsync(new IPEndPoint(entryIp, port), cancellationToken);
-                                            return new NetworkStream(fallbackSocket, ownsSocket: true);
-                                        }
-                                        catch
-                                        {
-                                            fallbackSocket.Dispose();
-                                            throw;
-                                        }
-                                    }
-                                };
-
-                                using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(15) };
-                                var request = new HttpRequestMessage(HttpMethod.Post, targetUri);
-                                request.Headers.Add("User-Agent", "ApusPay-Hook/1.0 (Windows NT 10.0; Win64; x64)");
-                                request.Headers.Add("Accept", "application/json");
-                                if (!string.IsNullOrWhiteSpace(hookToken))
-                                {
-                                    request.Headers.Add("X-Hook-Token", hookToken);
-                                }
-                                
-                                string jsonString = JsonSerializer.Serialize(new
-                                {
-                                    type = "wechat",
-                                    flag = message.SenderId == "gh_3dfda90e39d6" ? "reawrd-code" : "",
-                                    money = message.Money ?? "",
-                                    token = hookToken,
-                                }, serializerOptions);
-                                request.Content = new StringContent(jsonString, utf8, "application/json");
-                                request.Content.Headers.ContentLength = utf8.GetByteCount(jsonString);
-
-                                var response = client.Send(request);
-                                var respContent = response.Content.ReadAsStringAsync().Result;
-                                if (response.IsSuccessStatusCode)
-                                {
-                                    info($"后端响应成功: {respContent}");
-                                }
-                                else
-                                {
-                                    error($"后端返回错误 [{(int)response.StatusCode}]: {respContent}");
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                var inner = ex.InnerException != null ? $": {ex.InnerException.Message}" : "";
-                                error($"提交收款记录时发生错误: {ex.Message}{inner}");
-                            }
+                            hot = hotFiles.Contains(file);
+                            known = classified.Contains(file);
                         }
-                        else
-                        {
-                            warn("未设置后端 API 地址，无法提交收款记录");
-                        }
+                        found.AddRange(await ProcessDb(file, queryIfUnchanged: hot || !known));
                     }
-                    conn.Close();
+                });
+                await SubmitMessages(found);
+            }
+            catch (Exception ex)
+            {
+                warnOnce("safety", $"定期核对失败: {ex.Message}");
+            }
+            finally
+            {
+                Interlocked.Exchange(ref safetyBusy, 0);
+            }
+        }
+
+        private async Task RunExclusive(Func<Task> work)
+        {
+            await exclusive.WaitAsync();
+            var previous = Thread.CurrentThread.Priority;
+            try
+            {
+                Thread.CurrentThread.Priority = ThreadPriority.BelowNormal;
+                await work();
+            }
+            finally
+            {
+                Thread.CurrentThread.Priority = previous;
+                exclusive.Release();
+            }
+        }
+
+        private async Task<List<Message>> ProcessDb(string dbPath, bool queryIfUnchanged)
+        {
+            var outcome = ReplicaStore.Sync(hexKey, dbPath);
+            if (outcome.Kind == SyncKind.Failed || outcome.Kind == SyncKind.Incomplete)
+            {
+                warnOnce(dbPath, $"{Path.GetFileName(dbPath)} {outcome.Error}");
+                return [];
+            }
+            if (outcome.Kind == SyncKind.Rebuilt)
+                info($"已为 {Path.GetFileName(dbPath)} 建立本地解密副本，之后只补变化的页");
+            bool known;
+            lock (stateLock) known = classified.Contains(dbPath);
+            if (outcome.Kind == SyncKind.Unchanged && known && !queryIfUnchanged) return [];
+
+            ScanResult scan;
+            try
+            {
+                scan = await DatabaseService.Scan(outcome.ReplicaPath);
+                TryDelete(outcome.ReplicaPath + "-wal");
+                TryDelete(outcome.ReplicaPath + "-shm");
+            }
+            catch (Exception ex)
+            {
+                warnOnce(dbPath, $"扫描 {Path.GetFileName(dbPath)} 失败: {ex.Message}");
+                return [];
+            }
+
+            lock (stateLock)
+            {
+                classified.Add(dbPath);
+                if (scan.HasPaymentAccount)
+                {
+                    if (hotFiles.Add(dbPath)) info($"热监听收款库 {Path.GetFileName(dbPath)}");
                 }
-                catch (Exception ex)
+                else if (hotFiles.Remove(dbPath))
                 {
-                    error($"处理收款记录时发生错误: {ex.Message}");
+                    info($"停止热监听 {Path.GetFileName(dbPath)}");
                 }
             }
+            return scan.Messages;
+        }
+
+        private List<string> ListCandidateDbs()
+        {
+            var files = new List<string>();
+            if (!Directory.Exists(realDbFolder)) return files;
+            foreach (var file in Directory.EnumerateFiles(realDbFolder))
+            {
+                if (!IsMessageDatabase(Path.GetFileName(file))) continue;
+                files.Add(Path.GetFullPath(file));
+            }
+            return files;
+        }
+
+        private async Task SubmitMessages(ICollection<Message> messages)
+        {
+            if (messages.Count == 0 || closing) return;
+            await submitGate.WaitAsync();
+            try
+            {
+                if (suppressSubmit)
+                {
+                    lock (storageLock)
+                    {
+                        foreach (var message in messages) PutHandled(message);
+                    }
+                    return;
+                }
+                List<Message> fresh;
+                lock (storageLock) fresh = FilterUnacked(messages);
+                foreach (var message in fresh)
+                {
+                    if (closing) return;
+                    info($"提交收款记录到后端: ￥{message.Money}");
+                    if (await PostPayment(message))
+                    {
+                        lock (storageLock) PutHandled(message);
+                    }
+                }
+            }
+            finally
+            {
+                submitGate.Release();
+            }
+        }
+
+        private List<Message> FilterUnacked(ICollection<Message> messages)
+        {
+            var outdate = DateTimeOffset.UtcNow.AddMinutes(-DatabaseService.RecentMinutes);
+            var timestamp = outdate.ToUnixTimeSeconds();
+            var fresh = new List<Message>();
+            using var conn = new SqliteConnection(storageConnectionString);
+            conn.Open();
+            using var cmd = new SqliteCommand("SELECT server_seq, sender_id FROM handled_sequences WHERE create_time > $timestamp;", conn);
+            cmd.Parameters.AddWithValue("$timestamp", timestamp);
+            using var reader = cmd.ExecuteReader();
+            var handled = new HashSet<string>();
+            foreach (var item in reader)
+            {
+                if (item is not IDataRecord record) continue;
+                var serverSeq = record["server_seq"]?.ToString();
+                var senderId = record["sender_id"]?.ToString();
+                if (serverSeq == null || senderId == null) continue;
+                handled.Add(senderId + ";" + serverSeq);
+            }
+            foreach (var message in messages)
+            {
+                if (message.CreateTime <= outdate) continue;
+                var key = message.SenderId + ";" + message.ServerSequence;
+                if (!handled.Add(key)) continue;
+                fresh.Add(message);
+            }
+            return fresh;
+        }
+
+        private async Task<bool> PostPayment(Message message)
+        {
+            if (apiUrl == string.Empty)
+            {
+                warnOnce("api", "未设置后端 API 地址，无法提交收款记录");
+                return false;
+            }
+            try
+            {
+                var request = new HttpRequestMessage(HttpMethod.Post, BuildTargetUri(apiUrl, hookToken));
+                request.Headers.Add("User-Agent", "ApusPay-Hook/1.0 (Windows NT 10.0; Win64; x64)");
+                request.Headers.Add("Accept", "application/json");
+                if (!string.IsNullOrWhiteSpace(hookToken)) request.Headers.Add("X-Hook-Token", hookToken);
+                string jsonString = JsonSerializer.Serialize(new
+                {
+                    type = "wechat",
+                    flag = message.SenderId == "gh_3dfda90e39d6" ? "reawrd-code" : "",
+                    money = message.Money ?? "",
+                    token = hookToken,
+                    event_id = message.SenderId + ":" + message.ServerSequence,
+                }, serializerOptions);
+                request.Content = new StringContent(jsonString, utf8, "application/json");
+                request.Content.Headers.ContentLength = utf8.GetByteCount(jsonString);
+                var response = await httpClient.SendAsync(request);
+                var respContent = await response.Content.ReadAsStringAsync();
+                if (response.IsSuccessStatusCode)
+                {
+                    info($"后端响应成功: {respContent}");
+                    return true;
+                }
+                error($"后端返回错误 [{(int)response.StatusCode}]: {respContent}");
+                return false;
+            }
+            catch (Exception ex)
+            {
+                var inner = ex.InnerException != null ? $": {ex.InnerException.Message}" : "";
+                error($"提交收款记录时发生错误: {ex.Message}{inner}");
+                return false;
+            }
+        }
+
+        private async ValueTask<Stream> ConnectSocket(SocketsHttpConnectionContext context, CancellationToken cancellationToken)
+        {
+            var targetHost = context.DnsEndPoint.Host;
+            var port = context.DnsEndPoint.Port;
+            bool isLocalOrIp = IPAddress.TryParse(targetHost, out _)
+                || targetHost.Equals("localhost", StringComparison.OrdinalIgnoreCase)
+                || targetHost.EndsWith(".local", StringComparison.OrdinalIgnoreCase);
+            var optimalIp = (CloudflareOptimizer.Enabled && !isLocalOrIp) ? CloudflareOptimizer.OptimalIp : null;
+            if (optimalIp != null)
+            {
+                var socket = new Socket(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+                try
+                {
+                    await socket.ConnectAsync(new IPEndPoint(optimalIp, port), cancellationToken);
+                    return new NetworkStream(socket, ownsSocket: true);
+                }
+                catch
+                {
+                    socket.Dispose();
+                    CloudflareOptimizer.NotifyFailure(optimalIp);
+                }
+            }
+
+            var hostEntry = await Dns.GetHostEntryAsync(targetHost, cancellationToken);
+            var entryIp = hostEntry.AddressList.FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetwork) ?? hostEntry.AddressList[0];
+            var fallbackSocket = new Socket(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+            try
+            {
+                await fallbackSocket.ConnectAsync(new IPEndPoint(entryIp, port), cancellationToken);
+                return new NetworkStream(fallbackSocket, ownsSocket: true);
+            }
+            catch
+            {
+                fallbackSocket.Dispose();
+                throw;
+            }
+        }
+
+        private void warnOnce(string key, string message)
+        {
+            var now = DateTime.UtcNow;
+            lock (warnLock)
+            {
+                if (lastWarn.TryGetValue(key, out var at) && now - at < TimeSpan.FromSeconds(60)) return;
+                lastWarn[key] = now;
+            }
+            warn(message);
+        }
+
+        private static void TryDelete(string path)
+        {
+            try { if (File.Exists(path)) File.Delete(path); } catch { }
         }
 
         private static string ExtractTokenFromUrl(string url)
@@ -337,8 +501,17 @@ namespace WeChatHook
             using (var conn = new SqliteConnection(storageConnectionString))
             {
                 conn.Open();
-                using var cmd = new SqliteCommand("CREATE TABLE if NOT EXISTS 'handled_sequences'(`server_seq` INT32, `sender_id` VARCHAR(24), `create_time` INT32);", conn);
+                using var cmd = new SqliteCommand("CREATE TABLE if NOT EXISTS handled_sequences(server_seq INTEGER, sender_id TEXT, create_time INTEGER);", conn);
                 cmd.ExecuteNonQuery();
+                try
+                {
+                    using var index = new SqliteCommand("CREATE UNIQUE INDEX if NOT EXISTS idx_handled_sender_seq ON handled_sequences(sender_id, server_seq);", conn);
+                    index.ExecuteNonQuery();
+                }
+                catch (Exception ex)
+                {
+                    warn($"收款去重索引未建立: {ex.Message}");
+                }
             }
             comments.Clear();
             Config.Clear();
@@ -459,14 +632,27 @@ namespace WeChatHook
         private void CheckWatcherStatus()
         {
             var oldStatus = watcher.EnableRaisingEvents;
+            bool folderChanged = !string.Equals(watchedFolder, realDbFolder, StringComparison.OrdinalIgnoreCase);
+            if (folderChanged)
+            {
+                lock (stateLock)
+                {
+                    hotFiles.Clear();
+                    classified.Clear();
+                }
+                watchedFolder = realDbFolder;
+            }
+            bool rescan = forceRescan || folderChanged;
+            forceRescan = false;
             if (realDbFolder != string.Empty && hexKey != string.Empty)
             {
+                if ((!oldStatus || rescan) && !HasHandledHistory()) suppressSubmit = true;
                 watcher.Path = realDbFolder;
                 watcher.EnableRaisingEvents = true;
-                if (!oldStatus)
+                if (!oldStatus || rescan)
                 {
-                    info("聊天数据文件监视器已开启");
-                    Task.Run(async () => await ScanAll(false));
+                    info("聊天数据监视已开启：收款库约 0.8 秒合并处理，其余库每 20 秒只看有没有变化");
+                    _ = Task.Run(ScanAll);
                 }
             }
             else
@@ -482,67 +668,79 @@ namespace WeChatHook
             SaveConfig();
         }
 
-        private async Task ScanAll(bool submit)
+        private async Task ScanAll()
         {
-            if (hexKey == string.Empty)
+            try
             {
-                error("未设置微信密钥");
-                return;
-            }
-            if (realDbFolder == string.Empty)
-            {
-                error("未设置微信数据库路径");
-                return;
-            }
-            info("开始扫描所有聊天数据文件…");
-            var messages = new HashSet<Message>();
-            var directory = new DirectoryInfo(realDbFolder);
-            var warning = true;
-            foreach (var file in directory.GetFiles())
-            {
-                if ((file.Name.StartsWith("biz_message_") || file.Name.StartsWith("message_")) && file.Name.EndsWith(".db"))
+                if (hexKey == string.Empty)
                 {
-                    warning = false;
+                    error("未设置微信密钥");
+                    return;
+                }
+                if (realDbFolder == string.Empty)
+                {
+                    error("未设置微信数据库路径");
+                    return;
+                }
+                var files = ListCandidateDbs();
+                if (files.Count == 0)
+                {
+                    warn("在数据库文件夹下没有发现消息库，请确认路径是 db_storage\\message");
+                    return;
+                }
+                info("开始核对收款库…");
+                var found = new List<Message>();
+                await RunExclusive(async () =>
+                {
+                    foreach (var file in files)
+                    {
+                        found.AddRange(await ProcessDb(file, queryIfUnchanged: true));
+                    }
+                });
+                if (suppressSubmit)
+                {
+                    await submitGate.WaitAsync();
                     try
                     {
-                        var target = temp + "\\" + file.Name.Replace(".db", "") + "-" + Guid.NewGuid() + ".db";
-                        DecryptService.DecryptDatabase(hexKey, file.FullName, target);
-                        var scan = await DatabaseService.Scan(target);
-                        foreach (var message in scan)
+                        lock (storageLock)
                         {
-                            messages.Add(message);
+                            foreach (var message in found) PutHandled(message);
                         }
-                        DeleteDatabaseFile(target);
                     }
-                    catch (Exception ex)
+                    finally
                     {
-                        error($"(扫描全部) 处理 {file.Name} 时发生错误: ${ex}");
+                        submitGate.Release();
                     }
+                    info("首次启动，最近的历史收款不补报，从现在开始监听");
                 }
+                else
+                {
+                    await SubmitMessages(found);
+                }
+                int hot;
+                lock (stateLock) hot = hotFiles.Count;
+                info($"核对完成，热监听 {hot} 个收款库");
             }
-            if (warning)
+            finally
             {
-                warn($"在数据库文件夹下没有发现 .db 文件，你确定你输入的路径是正确的吗？");
+                suppressSubmit = false;
             }
-            else
-            {
-                info($"共发现最近 {DatabaseService.RecentMinutes} 分钟内有 {messages.Count} 条收款记录");
-            }
-
-            handleMessageSubmit(messages, submit);
         }
 
-        private void DeleteDatabaseFile(string target)
+        private bool HasHandledHistory()
         {
-            if (File.Exists(target)) File.Delete(target);
-            if (File.Exists(target + "-shm")) File.Delete(target + "-shm");
-            if (File.Exists(target + "-wal")) File.Delete(target + "-wal");
+            using var conn = new SqliteConnection(storageConnectionString);
+            conn.Open();
+            using var cmd = new SqliteCommand("SELECT 1 FROM handled_sequences LIMIT 1;", conn);
+            return cmd.ExecuteScalar() != null;
         }
 
-        private void PutHandled(SqliteConnection conn, Message message)
+        private void PutHandled(Message message)
         {
             debug($"提交 {message.SenderId} 在 {message.CreateTime.ToString("yyyy-MM-dd HH:mm:ss")} 的消息 {message.ServerSequence} 为已处理: {message.MessageContent.Replace("\n", "").Replace("\r", "")}");
-            using var cmd = new SqliteCommand("INSERT INTO 'handled_sequences'(`server_seq`,`sender_id`,`create_time`) VALUES($server_seq,$sender_id,$create_time);", conn);
+            using var conn = new SqliteConnection(storageConnectionString);
+            conn.Open();
+            using var cmd = new SqliteCommand("INSERT OR IGNORE INTO handled_sequences(server_seq, sender_id, create_time) VALUES($server_seq, $sender_id, $create_time);", conn);
             cmd.Parameters.Add("$server_seq", SqliteType.Integer).Value = Convert.ToInt64(message.ServerSequence);
             cmd.Parameters.Add("$sender_id", SqliteType.Text).Value = message.SenderId;
             cmd.Parameters.Add("$create_time", SqliteType.Integer).Value = message.CreateTime.ToUnixTimeSeconds();
@@ -643,7 +841,15 @@ namespace WeChatHook
             var dialog = new DialogSetKey(hexKey);
             if (dialog.ShowDialog() == true)
             {
-                hexKey = dialog.Text;
+                hexKey = dialog.Text.Trim();
+                DecryptService.ClearKeyCache();
+                ReplicaStore.Reset();
+                lock (stateLock)
+                {
+                    hotFiles.Clear();
+                    classified.Clear();
+                }
+                forceRescan = true;
                 SaveConfig();
                 CheckWatcherStatus();
             }
@@ -698,16 +904,17 @@ namespace WeChatHook
 
         private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
         {
+            closing = true;
+            safetyTimer.Dispose();
             watcher.EnableRaisingEvents = false;
             watcher.Dispose();
-            var directory = new DirectoryInfo(temp);
-            foreach (var file in directory.GetFiles())
+            httpClient.Dispose();
+            if (Directory.Exists(temp))
             {
-                try
+                foreach (var file in new DirectoryInfo(temp).GetFiles())
                 {
-                    file.Delete();
+                    try { file.Delete(); } catch { }
                 }
-                catch { }
             }
         }
 

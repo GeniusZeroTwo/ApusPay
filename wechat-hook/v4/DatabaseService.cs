@@ -1,6 +1,8 @@
 using Microsoft.Data.Sqlite;
 using System.Data;
 using System.IO;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace WeChatHook
@@ -86,77 +88,147 @@ namespace WeChatHook
             return HashCode.Combine(ServerSequence, SenderId);
         }
     }
+    public sealed class ScanResult
+    {
+        public List<Message> Messages { get; init; } = [];
+        public bool HasPaymentAccount { get; init; }
+    }
+
     public class DatabaseService
     {
-        private static readonly List<string> AllowSenders = [ "gh_f0a92aa7146c", "gh_3dfda90e39d6" ];
+        private static readonly string[] AllowSenders = ["gh_f0a92aa7146c", "gh_3dfda90e39d6"];
         public static int RecentMinutes = 15;
-        public static async Task<List<Message>> Scan(string dbFile)
+
+        public static async Task<ScanResult> Scan(string dbFile)
         {
             var connectionString = new SqliteConnectionStringBuilder
             {
                 DataSource = dbFile,
                 Mode = SqliteOpenMode.ReadOnly,
-                Cache = SqliteCacheMode.Shared,
+                Cache = SqliteCacheMode.Private,
                 Pooling = false,
             }.ToString();
-            var conn = new SqliteConnection(connectionString);
+            await using var conn = new SqliteConnection(connectionString);
             await conn.OpenAsync();
-            var tables = new List<string>();
-            var messages = new List<Message>();
-            // 查询所有表，找到表名 Msg_ 开头的表
+
+            Dictionary<long, string> senders;
             try
             {
-                using (var cmd = new SqliteCommand("SELECT name FROM sqlite_master WHERE type='table'", conn))
-                {
-                    using var reader = cmd.ExecuteReader();
-                    foreach (var item in reader)
-                    {
-                        if (item is not IDataRecord record) continue;
-                        var name = record["name"].ToString() ?? "";
-                        if (name.StartsWith("Msg_", true, null))
-                        {
-                            tables.Add(name);
-                        }
-                    }
-                }
+                senders = ReadPaymentSenders(conn);
             }
             catch (Exception e)
             {
-                throw new Exception($"在读取数据库文件 ${new FileInfo(dbFile).Name} 的所有数据表时出现异常", e);
+                throw new Exception($"在读取数据库文件 {new FileInfo(dbFile).Name} 的 Name2Id 时出现异常", e);
             }
+            if (senders.Count == 0)
+                return new ScanResult();
+
+            List<string> tables;
+            try
+            {
+                tables = ChooseTables(conn, senders.Values);
+            }
+            catch (Exception e)
+            {
+                throw new Exception($"在读取数据库文件 {new FileInfo(dbFile).Name} 的所有数据表时出现异常", e);
+            }
+
+            var messages = new List<Message>();
             var timestamp = DateTimeOffset.UtcNow.AddMinutes(-RecentMinutes).ToUnixTimeSeconds();
             foreach (var tableName in tables)
             {
+                if (!IsSafeIdentifier(tableName)) continue;
                 try
                 {
-                    using var cmd = new SqliteCommand($"SELECT m.*, " +
-                            $"CASE WHEN m.real_sender_id = 1 THEN 1 ELSE 0 END AS is_send, " +
-                            $"n.user_name AS sender_id " +
-                            $"FROM {tableName} m " +
-                            $"LEFT JOIN Name2Id n ON m.real_sender_id = n.rowid " +
-                            $"WHERE m.create_time > {timestamp}", conn);
-                    using var reader = cmd.ExecuteReader();
-                    foreach (var item in reader)
-                    {
-                        if (item is not IDataRecord record) continue;
-                        var sender_id = DecryptService.GetString(record, "sender_id");
-                        if (!AllowSenders.Contains(sender_id)) continue;
-                        try
-                        {
-                            var message = new Message(record);
-                            if (message.Money != null) messages.Add(message);
-                            //messages.Add(message);
-                        }
-                        catch { }
-                    }
+                    ReadTable(conn, tableName, senders.Keys, timestamp, messages);
                 }
                 catch (Exception e)
                 {
-                    throw new Exception($"在读取数据库文件 ${new FileInfo(dbFile).Name} 的数据表 {tableName} 时出现异常", e);
+                    throw new Exception($"在读取数据库文件 {new FileInfo(dbFile).Name} 的数据表 {tableName} 时出现异常", e);
                 }
             }
-            await conn.CloseAsync();
-            return messages;
+            return new ScanResult { Messages = messages, HasPaymentAccount = true };
         }
+
+        private static Dictionary<long, string> ReadPaymentSenders(SqliteConnection conn)
+        {
+            var senders = new Dictionary<long, string>();
+            using var cmd = new SqliteCommand("SELECT rowid, user_name FROM Name2Id WHERE user_name IN ($a, $b)", conn);
+            cmd.Parameters.AddWithValue("$a", AllowSenders[0]);
+            cmd.Parameters.AddWithValue("$b", AllowSenders[1]);
+            using var reader = cmd.ExecuteReader();
+            foreach (var item in reader)
+            {
+                if (item is not IDataRecord record) continue;
+                var name = DecryptService.GetString(record, "user_name");
+                if (!AllowSenders.Contains(name)) continue;
+                senders[Convert.ToInt64(record["rowid"])] = name;
+            }
+            return senders;
+        }
+
+        private static List<string> ChooseTables(SqliteConnection conn, IEnumerable<string> usernames)
+        {
+            var all = new List<string>();
+            using (var cmd = new SqliteCommand("SELECT name FROM sqlite_master WHERE type='table'", conn))
+            using (var reader = cmd.ExecuteReader())
+            {
+                foreach (var item in reader)
+                {
+                    if (item is not IDataRecord record) continue;
+                    var name = record["name"]?.ToString() ?? "";
+                    if (name.StartsWith("Msg_", StringComparison.OrdinalIgnoreCase)) all.Add(name);
+                }
+            }
+
+            var preferred = new List<string>();
+            var known = new HashSet<string>(all, StringComparer.OrdinalIgnoreCase);
+            foreach (var username in usernames)
+            {
+                var md5 = Convert.ToHexString(MD5.HashData(Encoding.UTF8.GetBytes(username))).ToLowerInvariant();
+                var table = "Msg_" + md5;
+                if (known.Contains(table)) preferred.Add(table);
+            }
+            return preferred.Count > 0 ? preferred : all;
+        }
+
+        private static void ReadTable(SqliteConnection conn, string tableName, ICollection<long> senderIds, long timestamp, List<Message> messages)
+        {
+            var names = new string[senderIds.Count];
+            var index = 0;
+            foreach (var id in senderIds)
+            {
+                names[index] = "$id" + index;
+                index++;
+            }
+            using var cmd = new SqliteCommand(
+                $"SELECT m.server_seq, m.create_time, m.message_content, n.user_name AS sender_id " +
+                $"FROM \"{tableName}\" m " +
+                $"LEFT JOIN Name2Id n ON m.real_sender_id = n.rowid " +
+                $"WHERE m.create_time > $ts AND m.real_sender_id IN ({string.Join(",", names)})", conn);
+            cmd.Parameters.AddWithValue("$ts", timestamp);
+            index = 0;
+            foreach (var id in senderIds)
+            {
+                cmd.Parameters.AddWithValue(names[index], id);
+                index++;
+            }
+            using var reader = cmd.ExecuteReader();
+            foreach (var item in reader)
+            {
+                if (item is not IDataRecord record) continue;
+                var senderId = DecryptService.GetString(record, "sender_id");
+                if (!AllowSenders.Contains(senderId)) continue;
+                try
+                {
+                    var message = new Message(record);
+                    if (message.Money != null) messages.Add(message);
+                }
+                catch { }
+            }
+        }
+
+        private static bool IsSafeIdentifier(string name) =>
+            name.Length > 0 && name.All(ch => char.IsAsciiLetterOrDigit(ch) || ch == '_');
     }
 }

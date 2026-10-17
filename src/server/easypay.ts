@@ -467,6 +467,15 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
       const cleanMoney = money.replace(/^[￥¥\$\s]+/, "").trim();
       const amountCents = parseMoneyToCents(cleanMoney);
       const targetChannel = type === "wechat" || type === "wxpay" ? "wxpay" : "alipay";
+      const rawEventId = String(body.event_id ?? "").trim();
+      const eventId = /^[A-Za-z0-9_:\-]{1,128}$/.test(rawEventId) ? rawEventId : "";
+
+      if (eventId) {
+        const seen = database.query("SELECT trade_no FROM hook_events WHERE event_id = ?").get(eventId) as { trade_no: string } | null;
+        if (seen) {
+          return c.json({ code: 1, msg: "重复通知已忽略", trade_no: seen.trade_no, duplicate: true });
+        }
+      }
 
       // Match pending order by payable_amount_cents
       const candidate = database.query(`
@@ -480,11 +489,21 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
         return c.json({ code: 0, msg: "未找到待支付的匹配订单", money, type: targetChannel });
       }
 
-      markOrderPaidDirectly(database, candidate.id, {
+      const paid = markOrderPaidDirectly(database, candidate.id, {
         channel: targetChannel,
-        channelOrderId: `HOOK-${Date.now()}`,
+        channelOrderId: eventId ? `HOOK-${eventId}` : `HOOK-${Date.now()}`,
         buyer: "PC-Hook",
+        eventId: eventId || undefined,
       });
+      if (!paid) {
+        if (eventId) {
+          const seen = database.query("SELECT trade_no FROM hook_events WHERE event_id = ?").get(eventId) as { trade_no: string } | null;
+          if (seen) {
+            return c.json({ code: 1, msg: "重复通知已忽略", trade_no: seen.trade_no, duplicate: true });
+          }
+        }
+        return c.json({ code: 0, msg: "订单状态已变化" }, 409);
+      }
 
       console.info(`[Hook] 收款成功匹配订单: trade_no=${candidate.trade_no}, out_trade_no=${candidate.out_trade_no}, 金额=¥${cleanMoney}`);
 

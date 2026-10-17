@@ -179,5 +179,47 @@ describe("PC WeChat Hook contract", () => {
     const { getOrderById } = await import("../src/server/orders");
     const updated = getOrderById(database, order.id);
     expect(updated?.status).toBe("paid");
+
+    // 5. The same receipt event must not pay a later order of the same amount
+    const { order: replayOrder } = await createOrder(database, {
+      pid: "1000000001",
+      apiVersion: "v1",
+      type: "wxpay",
+      outTradeNo: "HOOK-TEST-2",
+      name: "Hook item 2",
+      money: "6.00",
+      notifyUrl: "https://8.8.8.8/notify",
+      returnUrl: "https://8.8.8.8/return",
+    });
+    const firstReceipt = await app.request("http://localhost/api/hook/receive?token=test-secret-token", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type: "wechat", money: "6.00", event_id: "gh_f0a92aa7146c:1001" }),
+    });
+    expect(firstReceipt.status).toBe(200);
+    const firstBody = await firstReceipt.json() as Record<string, unknown>;
+    expect(firstBody.code).toBe(1);
+    expect(firstBody.trade_no).toBe(replayOrder.trade_no);
+
+    const { order: laterOrder } = await createOrder(database, {
+      pid: "1000000001",
+      apiVersion: "v1",
+      type: "wxpay",
+      outTradeNo: "HOOK-TEST-3",
+      name: "Hook item 3",
+      money: "6.00",
+      notifyUrl: "https://8.8.8.8/notify",
+      returnUrl: "https://8.8.8.8/return",
+    });
+    const replay = await app.request("http://localhost/api/hook/receive?token=test-secret-token", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type: "wechat", money: "6.00", event_id: "gh_f0a92aa7146c:1001" }),
+    });
+    expect(replay.status).toBe(200);
+    const replayBody = await replay.json() as Record<string, unknown>;
+    expect(replayBody.duplicate).toBe(true);
+    expect(replayBody.trade_no).toBe(replayOrder.trade_no);
+    expect(getOrderById(database, laterOrder.id)?.status).toBe("pending");
   });
 });

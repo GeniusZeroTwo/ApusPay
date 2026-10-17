@@ -231,6 +231,25 @@ export function createDatabase(path = getRuntimeEnv().databasePath): AppDatabase
     }
   }
 
+  const hookEventMigration = database.query("SELECT 1 FROM schema_migrations WHERE version = 4").get();
+  if (!hookEventMigration) {
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      database.exec(`
+        CREATE TABLE IF NOT EXISTS hook_events (
+          event_id TEXT PRIMARY KEY,
+          trade_no TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+      `);
+      database.query("INSERT INTO schema_migrations(version, applied_at) VALUES (4, ?)").run(now);
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   const insert = database.query("INSERT OR IGNORE INTO settings(key, value_json, is_secret, updated_at) VALUES (?, ?, 0, ?)");
   for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) insert.run(key, JSON.stringify(value), now);
   if (!getSetting<string>(database, "public_base_url", "")) {
