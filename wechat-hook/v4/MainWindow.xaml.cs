@@ -108,10 +108,29 @@ namespace WeChatHook
             return Path.GetFullPath(dbPath);
         }
 
-        private static bool IsMessageDatabase(string fileName) =>
-            fileName.EndsWith(".db", StringComparison.OrdinalIgnoreCase)
-            && (fileName.StartsWith("message_", StringComparison.OrdinalIgnoreCase)
-                || fileName.StartsWith("biz_message_", StringComparison.OrdinalIgnoreCase));
+        // 只要 message_0.db / biz_message_0.db 这种分片。fts、resource 没有 Name2Id，解密后也扫不出收款。
+        private static bool IsMessageDatabase(string fileName)
+        {
+            if (!fileName.EndsWith(".db", StringComparison.OrdinalIgnoreCase)) return false;
+            var stem = fileName[..^3];
+            const string biz = "biz_message_";
+            const string message = "message_";
+            if (stem.StartsWith(biz, StringComparison.OrdinalIgnoreCase))
+                return IsAllDigits(stem[biz.Length..]);
+            if (stem.StartsWith(message, StringComparison.OrdinalIgnoreCase))
+                return IsAllDigits(stem[message.Length..]);
+            return false;
+        }
+
+        private static bool IsAllDigits(string value)
+        {
+            if (value.Length == 0) return false;
+            foreach (var ch in value)
+            {
+                if (ch < '0' || ch > '9') return false;
+            }
+            return true;
+        }
 
         private void Schedule(string dbPath)
         {
@@ -243,7 +262,8 @@ namespace WeChatHook
             }
             catch (Exception ex)
             {
-                warnOnce(dbPath, $"扫描 {Path.GetFileName(dbPath)} 失败: {ex.Message}");
+                var detail = ex.InnerException == null ? ex.Message : $"{ex.Message} ({ex.InnerException.Message})";
+                warnOnce(dbPath, $"扫描 {Path.GetFileName(dbPath)} 失败: {detail}");
                 return [];
             }
 

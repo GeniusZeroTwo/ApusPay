@@ -110,6 +110,8 @@ namespace WeChatHook
             }.ToString();
             await using var conn = new SqliteConnection(connectionString);
             await conn.OpenAsync();
+            if (!TableExists(conn, "Name2Id"))
+                return new ScanResult();
 
             Dictionary<long, string> senders;
             try
@@ -148,6 +150,13 @@ namespace WeChatHook
                 }
             }
             return new ScanResult { Messages = messages, HasPaymentAccount = true };
+        }
+
+        private static bool TableExists(SqliteConnection conn, string name)
+        {
+            using var cmd = new SqliteCommand("SELECT 1 FROM sqlite_master WHERE type='table' AND name=$n LIMIT 1", conn);
+            cmd.Parameters.AddWithValue("$n", name);
+            return cmd.ExecuteScalar() != null;
         }
 
         private static Dictionary<long, string> ReadPaymentSenders(SqliteConnection conn)
