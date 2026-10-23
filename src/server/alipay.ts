@@ -18,7 +18,7 @@ export interface AccountLogPage {
 export interface AccountLogProvider {
   query(input: { startTime: string; endTime: string; pageNo: number; pageSize: number }): Promise<AccountLogPage>;
   precreateTrade?(input: { outTradeNo: string; totalAmount: string; subject: string }): Promise<{ qrCode: string }>;
-  queryTrade?(outTradeNo: string): Promise<{ success: boolean; tradeNo?: string; buyerId?: string; tradeStatus?: string }>;
+  queryTrade?(outTradeNo: string): Promise<{ success: boolean; tradeNo?: string; buyerId?: string; tradeStatus?: string; amountCents?: number }>;
   closeTrade?(outTradeNo: string): Promise<void>;
 }
 
@@ -95,7 +95,7 @@ export class OfficialAlipayProvider implements AccountLogProvider {
     return { qrCode };
   }
 
-  async queryTrade(outTradeNo: string): Promise<{ success: boolean; tradeNo?: string; buyerId?: string; tradeStatus?: string }> {
+  async queryTrade(outTradeNo: string): Promise<{ success: boolean; tradeNo?: string; buyerId?: string; tradeStatus?: string; amountCents?: number }> {
     const sdk = this.getSdk();
     try {
       const result = (await sdk.exec("alipay.trade.query", {
@@ -104,8 +104,12 @@ export class OfficialAlipayProvider implements AccountLogProvider {
       const tradeStatus = (result.trade_status ?? result.tradeStatus ?? "") as string;
       const tradeNo = (result.trade_no ?? result.tradeNo ?? "") as string;
       const buyerId = (result.buyer_user_id ?? result.buyerUserId ?? result.buyer_logon_id ?? "") as string;
-      const success = tradeStatus === "TRADE_SUCCESS" || tradeStatus === "TRADE_FINISHED";
-      return { success, tradeNo, buyerId, tradeStatus };
+      const rawTotal = result.total_amount ?? result.totalAmount;
+      const amountCents = rawTotal !== undefined && rawTotal !== null && String(rawTotal).trim() !== ""
+        ? parseMoneyToCents(String(rawTotal))
+        : undefined;
+      const success = (tradeStatus === "TRADE_SUCCESS" || tradeStatus === "TRADE_FINISHED") && amountCents !== undefined;
+      return { success, tradeNo, buyerId, tradeStatus, amountCents };
     } catch {
       return { success: false };
     }
@@ -213,7 +217,7 @@ export class PaymentScanner {
     if (order.collection_mode === "alipay_f2f" && this.provider.queryTrade) {
       try {
         const query = await this.provider.queryTrade(order.trade_no);
-        if (query.success) {
+        if (query.success && (query.amountCents === undefined || query.amountCents === order.payable_amount_cents)) {
           markOrderPaidDirectly(this.database, order.id, {
             channel: "alipay",
             channelOrderId: query.tradeNo,
@@ -225,7 +229,7 @@ export class PaymentScanner {
     } else if (order.collection_mode === "wxpay_native") {
       try {
         const query = await this.wechat.queryOrder(order.trade_no);
-        if (query.tradeState === "SUCCESS") {
+        if (query.tradeState === "SUCCESS" && query.amountCents === order.payable_amount_cents) {
           markOrderPaidDirectly(this.database, order.id, {
             channel: "wxpay",
             channelOrderId: query.transactionId,
@@ -276,7 +280,7 @@ export class PaymentScanner {
       for (const order of f2fOrders) {
         try {
           const res = await this.provider.queryTrade(order.trade_no);
-          if (res.success) {
+          if (res.success && (res.amountCents === undefined || res.amountCents === order.payable_amount_cents)) {
             const ok = markOrderPaidDirectly(this.database, order.id, {
               channel: "alipay",
               channelOrderId: res.tradeNo,
@@ -294,7 +298,7 @@ export class PaymentScanner {
     for (const order of wxOrders) {
       try {
         const res = await this.wechat.queryOrder(order.trade_no);
-        if (res.tradeState === "SUCCESS") {
+        if (res.tradeState === "SUCCESS" && res.amountCents === order.payable_amount_cents) {
           const ok = markOrderPaidDirectly(this.database, order.id, {
             channel: "wxpay",
             channelOrderId: res.transactionId,

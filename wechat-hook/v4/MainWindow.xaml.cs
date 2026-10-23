@@ -6,6 +6,7 @@ using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Windows;
@@ -474,12 +475,9 @@ namespace WeChatHook
         private static Uri BuildTargetUri(string baseApiUrl, string token)
         {
             var uri = new Uri(baseApiUrl);
-            if (string.IsNullOrWhiteSpace(token)) return uri;
-
             var uriBuilder = new UriBuilder(uri);
             var query = uriBuilder.Query.TrimStart('?');
             var queryParts = new List<string>();
-            bool tokenReplaced = false;
 
             if (!string.IsNullOrEmpty(query))
             {
@@ -488,23 +486,47 @@ namespace WeChatHook
                     var kv = part.Split('=', 2);
                     if (kv[0].Trim().Equals("token", StringComparison.OrdinalIgnoreCase))
                     {
-                        queryParts.Add($"token={Uri.EscapeDataString(token)}");
-                        tokenReplaced = true;
+                        // Strip token from URL query string to prevent leakage in reverse proxy access logs
+                        continue;
                     }
-                    else
-                    {
-                        queryParts.Add(part);
-                    }
+                    queryParts.Add(part);
                 }
-            }
-
-            if (!tokenReplaced)
-            {
-                queryParts.Add($"token={Uri.EscapeDataString(token)}");
             }
 
             uriBuilder.Query = string.Join("&", queryParts);
             return uriBuilder.Uri;
+        }
+
+        private static string ProtectSecret(string plainText)
+        {
+            if (string.IsNullOrEmpty(plainText) || plainText.StartsWith("dpapi:", StringComparison.OrdinalIgnoreCase))
+                return plainText;
+            try
+            {
+                var bytes = Encoding.UTF8.GetBytes(plainText);
+                var encrypted = ProtectedData.Protect(bytes, null, DataProtectionScope.CurrentUser);
+                return "dpapi:" + Convert.ToBase64String(encrypted);
+            }
+            catch
+            {
+                return plainText;
+            }
+        }
+
+        private static string UnprotectSecret(string stored)
+        {
+            if (string.IsNullOrEmpty(stored) || !stored.StartsWith("dpapi:", StringComparison.OrdinalIgnoreCase))
+                return stored;
+            try
+            {
+                var encrypted = Convert.FromBase64String(stored.Substring("dpapi:".Length));
+                var decrypted = ProtectedData.Unprotect(encrypted, null, DataProtectionScope.CurrentUser);
+                return Encoding.UTF8.GetString(decrypted);
+            }
+            catch
+            {
+                return string.Empty;
+            }
         }
 
         private string? GetFromConfig(string name)
@@ -556,7 +578,7 @@ namespace WeChatHook
                 }
             }
             apiUrl = GetFromConfig("api_url") ?? "";
-            hookToken = GetFromConfig("hook_token") ?? GetFromConfig("token") ?? "";
+            hookToken = UnprotectSecret(GetFromConfig("hook_token") ?? GetFromConfig("token") ?? "");
             if (string.IsNullOrEmpty(hookToken) && !string.IsNullOrEmpty(apiUrl))
             {
                 var extracted = ExtractTokenFromUrl(apiUrl);
@@ -565,7 +587,7 @@ namespace WeChatHook
                     hookToken = extracted;
                 }
             }
-            hexKey = GetFromConfig("wechat_key") ?? "";
+            hexKey = UnprotectSecret(GetFromConfig("wechat_key") ?? "");
             databaseFolder = GetFromConfig("database_folder") ?? "auto";
             string cfOpt = GetFromConfig("cf_optimize") ?? "true";
             CloudflareOptimizer.Enabled = !string.Equals(cfOpt.Trim(), "false", StringComparison.OrdinalIgnoreCase);
@@ -630,9 +652,9 @@ namespace WeChatHook
             Config["api_url"] = apiUrl;
             if (!string.IsNullOrEmpty(hookToken))
             {
-                Config["hook_token"] = hookToken;
+                Config["hook_token"] = ProtectSecret(hookToken);
             }
-            Config["wechat_key"] = hexKey;
+            Config["wechat_key"] = ProtectSecret(hexKey);
             Config["database_folder"] = databaseFolder;
             Config["cf_optimize"] = CloudflareOptimizer.Enabled ? "true" : "false";
             if (!string.IsNullOrEmpty(CloudflareOptimizer.ManualIp))

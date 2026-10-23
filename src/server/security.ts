@@ -8,6 +8,7 @@ import {
   createVerify,
   generateKeyPairSync,
   randomBytes,
+  randomInt,
   timingSafeEqual,
 } from "node:crypto";
 import { isIP } from "node:net";
@@ -138,18 +139,18 @@ export function randomToken(bytes = 32) {
 
 export function randomDigits(length: number) {
   let output = "";
-  while (output.length < length) output += String(randomBytes(1)[0]! % 10);
+  while (output.length < length) output += String(randomInt(0, 10));
   return output.slice(0, length);
 }
 
 export function randomMerchantPid() {
-  return `${1 + (randomBytes(1)[0]! % 9)}${randomDigits(9)}`;
+  return `${randomInt(1, 10)}${randomDigits(9)}`;
 }
 
 export function randomAlphaNumeric(length: number) {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
   let output = "";
-  while (output.length < length) output += alphabet[randomBytes(1)[0]! % alphabet.length];
+  while (output.length < length) output += alphabet[randomInt(0, alphabet.length)];
   return output;
 }
 

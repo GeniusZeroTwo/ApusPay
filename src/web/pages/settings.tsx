@@ -71,6 +71,7 @@ function SettingsForm({ initial, refresh }: { initial: SettingsData; refresh: ()
   const [wxpayAppId, setWxpayAppId] = useState(initial.wxpay_app_id ?? "");
   const [wxpayMchId, setWxpayMchId] = useState(initial.wxpay_mch_id ?? "");
   const [wxpaySerialNo, setWxpaySerialNo] = useState(initial.wxpay_serial_no ?? "");
+  const [wxpayPublicKey, setWxpayPublicKey] = useState(initial.wxpay_public_key ?? "");
   const [wxpayPrivateKey, setWxpayPrivateKey] = useState("");
   const [wxpayApiV3Key, setWxpayApiV3Key] = useState("");
   const [wxpayHookToken, setWxpayHookToken] = useState(initial.wxpay_hook_token ?? "");
@@ -111,6 +112,7 @@ function SettingsForm({ initial, refresh }: { initial: SettingsData; refresh: ()
           wxpay_app_id: wxpayAppId,
           wxpay_mch_id: wxpayMchId,
           wxpay_serial_no: wxpaySerialNo,
+          wxpay_public_key: wxpayPublicKey,
           wxpay_hook_token: wxpayHookToken,
         }),
       });
@@ -551,6 +553,18 @@ function SettingsForm({ initial, refresh }: { initial: SettingsData; refresh: ()
                       placeholder="用于解密微信回调通知的 32 字符密钥"
                     />
                   </div>
+
+                  <div className="space-y-2">
+                    <Label htmlFor="wx-public-key">微信支付平台公钥 / 证书 (PEM，推荐配置以验签回调请求头)</Label>
+                    <Textarea
+                      id="wx-public-key"
+                      rows={3}
+                      className="font-mono text-xs"
+                      value={wxpayPublicKey}
+                      onChange={(e) => setWxpayPublicKey(e.target.value)}
+                      placeholder="-----BEGIN PUBLIC KEY----- ... -----END PUBLIC KEY-----"
+                    />
+                  </div>
                 </div>
               ) : (
                 <div className="mt-6 space-y-4 border-t pt-5">
@@ -611,18 +625,18 @@ function SettingsForm({ initial, refresh }: { initial: SettingsData; refresh: ()
 
                   <div className="space-y-2">
                     <div className="flex items-center justify-between">
-                      <Label htmlFor="wx-hook-token">Hook 鉴权 Token (可选)</Label>
+                      <Label htmlFor="wx-hook-token">Hook 鉴权 Token (必填，至少 8 位)</Label>
                       {initial.has_wxpay_hook_token ? (
-                        <span className="text-xs text-emerald-600 font-medium">● Token 已配置</span>
+                        <span className="text-xs text-emerald-600 font-medium">● Token 已受保护</span>
                       ) : (
-                        <span className="text-xs text-muted">未配置（留空保存即可清除）</span>
+                        <span className="text-xs text-destructive">未配置（保存时将自动生成）</span>
                       )}
                     </div>
                     <Input
                       id="wx-hook-token"
                       value={wxpayHookToken}
                       onChange={(e) => setWxpayHookToken(e.target.value)}
-                      placeholder="设置后 PC Hook 客户端请求必须附带此 Token（留空并保存即可清除）"
+                      placeholder="PC Hook 客户端请求必须通过 X-Hook-Token 请求头携带此密钥"
                     />
                   </div>
 
@@ -630,17 +644,15 @@ function SettingsForm({ initial, refresh }: { initial: SettingsData; refresh: ()
                     <div className="flex items-center justify-between">
                       <p className="font-semibold text-slate-800 dark:text-slate-200">Hook 接收接口地址 (填入 PC 客户端)：</p>
                       <CopyButton
-                        value={`${(initial.public_base_url || "http://your-domain.com").replace(/\/$/, "")}/api/hook/receive${wxpayHookToken.trim() ? `?token=${encodeURIComponent(wxpayHookToken.trim())}` : ""}`}
+                        value={`${(initial.public_base_url || "http://your-domain.com").replace(/\/$/, "")}/api/hook/receive`}
                         label="复制接口地址"
                       />
                     </div>
                     <code className="mt-1 block font-mono text-primary break-all">
-                      {(initial.public_base_url || "http://your-domain.com").replace(/\/$/, "")}/api/hook/receive{wxpayHookToken.trim() ? `?token=${encodeURIComponent(wxpayHookToken.trim())}` : ""}
+                      {(initial.public_base_url || "http://your-domain.com").replace(/\/$/, "")}/api/hook/receive
                     </code>
                     <p className="mt-2">
-                      {wxpayHookToken.trim()
-                        ? "已配置鉴权 Token。直接复制上方完整带 ?token= 参数的接口地址，填入 PC 微信 Hook 软件目录下的 config.properties 中的 api_url 即可。"
-                        : "PC Hook 客户端监听到到账后发送 POST 请求。未设置 Token 时可直接使用上方基础地址；设置 Token 后将自动追加 ?token= 参数。"}
+                      请将上方接口地址与 <code>hook_token</code> 填入 PC 微信 Hook 客户端的 <code>config.properties</code> 中，客户端将通过 <code>X-Hook-Token</code> 请求头安全鉴权（避免 URL 泄露密钥）。
                     </p>
                   </div>
                 </div>

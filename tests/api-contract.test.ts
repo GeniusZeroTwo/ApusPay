@@ -222,4 +222,24 @@ describe("PC WeChat Hook contract", () => {
     expect(replayBody.trade_no).toBe(replayOrder.trade_no);
     expect(getOrderById(database, laterOrder.id)?.status).toBe("pending");
   });
+
+  it("fails closed when wxpay_hook_token is not configured", async () => {
+    const configured = configuredDatabase("business_qr");
+    database = configured.database;
+    setSetting(database, "wxpay_mode", "hook");
+    setSetting(database, "wxpay_static_qr_url", "http://localhost/uploads/wechat-qr-test.png");
+
+    const scanner = new PaymentScanner(database, new EmptyProvider());
+    const { app } = createApp({ database, scanner, notifications: new NotificationWorker(database, fetch) });
+
+    const getUnconfigured = await app.request("http://localhost/api/hook/receive");
+    expect(getUnconfigured.status).toBe(503);
+
+    const postUnconfigured = await app.request("http://localhost/api/hook/receive", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type: "wechat", money: "5.00" }),
+    });
+    expect(postUnconfigured.status).toBe(503);
+  });
 });

@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { getSecret } from "./config";
 import { getSetting, type AppDatabase } from "./db";
 import { AppError } from "./errors";
+import { normalizePem } from "./security";
 
 export interface WeChatPrepayResult {
   codeUrl: string;
@@ -12,6 +13,7 @@ export interface WeChatQueryResult {
   transactionId?: string;
   successTime?: string;
   payerOpenid?: string;
+  amountCents?: number;
 }
 
 export class WeChatPayService {
@@ -107,12 +109,46 @@ export class WeChatPayService {
       throw new AppError(502, "WXPAY_QUERY_FAILED", String(resJson.message ?? "微信订单查询失败"));
     }
 
+    const rawTotal = (resJson.amount as Record<string, unknown> | undefined)?.total;
+    const amountCents = typeof rawTotal === "number" && Number.isInteger(rawTotal) ? rawTotal : undefined;
+
     return {
       tradeState: (resJson.trade_state as WeChatQueryResult["tradeState"]) || "NOTPAY",
       transactionId: typeof resJson.transaction_id === "string" ? resJson.transaction_id : undefined,
       successTime: typeof resJson.success_time === "string" ? resJson.success_time : undefined,
       payerOpenid: (resJson.payer as Record<string, unknown>)?.openid as string | undefined,
+      amountCents,
     };
+  }
+
+  verifyNotificationSignature(headers: Headers, rawBody: string): void {
+    const timestamp = headers.get("wechatpay-timestamp")?.trim() ?? "";
+    const nonce = headers.get("wechatpay-nonce")?.trim() ?? "";
+    const signature = headers.get("wechatpay-signature")?.trim() ?? "";
+    const platformPublicKey = getSetting(this.database, "wxpay_public_key", "").trim();
+
+    if (timestamp) {
+      if (!/^\d{10}$/.test(timestamp) || Math.abs(Math.floor(Date.now() / 1000) - Number(timestamp)) > 300) {
+        throw new AppError(401, "WXPAY_TIMESTAMP_EXPIRED", "微信回调时间戳无效或已过期");
+      }
+    }
+
+    if (platformPublicKey) {
+      if (!timestamp || !nonce || !signature) {
+        throw new AppError(401, "WXPAY_SIGNATURE_MISSING", "缺少微信支付回调签名头");
+      }
+      const message = `${timestamp}\n${nonce}\n${rawBody}\n`;
+      const pem = platformPublicKey.includes("-----BEGIN CERTIFICATE-----")
+        ? platformPublicKey
+        : normalizePem(platformPublicKey, "public");
+      const verifier = crypto.createVerify("RSA-SHA256");
+      verifier.update(message, "utf8");
+      verifier.end();
+      const valid = verifier.verify(crypto.createPublicKey(pem), signature, "base64");
+      if (!valid) {
+        throw new AppError(401, "WXPAY_INVALID_SIGNATURE", "微信支付平台签名校验失败");
+      }
+    }
   }
 
   async closeOrder(outTradeNo: string): Promise<void> {

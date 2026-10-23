@@ -145,7 +145,9 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
     const parsed = loginSchema.safeParse(json);
     if (!parsed.success) throw new AppError(400, "VALIDATION_FAILED", "用户名或密码格式错误");
     const rateLimitKey = ip ? `${ip}:${parsed.data.username}` : `user:${parsed.data.username}`;
+    const accountRateKey = `account:${parsed.data.username}`;
     checkLoginRateLimit(rateLimitKey);
+    checkLoginRateLimit(accountRateKey);
     if (ip) checkLoginRateLimit(`ip:${ip}`);
     const user = database.query("SELECT * FROM admin_users WHERE username = ?").get(parsed.data.username) as {
       id: string;
@@ -154,11 +156,13 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
     } | null;
     if (!user || !(await verifyPassword(parsed.data.password, user.password_hash))) {
       recordLoginFailure(rateLimitKey);
+      recordLoginFailure(accountRateKey, 20);
       if (ip) recordLoginFailure(`ip:${ip}`);
       audit(database, "auth.login_failed", { ip, details: { username: parsed.data.username } });
       throw new AppError(401, "INVALID_CREDENTIALS", "用户名或密码错误");
     }
     clearLoginFailures(rateLimitKey);
+    clearLoginFailures(accountRateKey);
     if (ip) clearLoginFailures(`ip:${ip}`);
     const session = createSession(database, user.id, c.req.raw.headers);
     setAuthCookies(c, session);
@@ -313,7 +317,7 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
     const allowed = new Set([
       "public_base_url", "collection_mode", "transfer_user_id",
       "alipay_enabled", "alipay_mode", "alipay_app_id", "alipay_endpoint", "alipay_public_key",
-      "wxpay_enabled", "wxpay_mode", "wxpay_app_id", "wxpay_mch_id", "wxpay_serial_no", "wxpay_static_qr_url",
+      "wxpay_enabled", "wxpay_mode", "wxpay_app_id", "wxpay_mch_id", "wxpay_serial_no", "wxpay_public_key", "wxpay_static_qr_url",
       "wxpay_hook_token",
       "transfer_link_layer", "payment_poll_interval_seconds", "v1_enabled", "v2_enabled", "business_qr_raw",
     ]);
@@ -341,8 +345,25 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
     if (typeof body.wxpay_app_id === "string") setSetting(database, "wxpay_app_id", body.wxpay_app_id.trim());
     if (typeof body.wxpay_mch_id === "string") setSetting(database, "wxpay_mch_id", body.wxpay_mch_id.trim());
     if (typeof body.wxpay_serial_no === "string") setSetting(database, "wxpay_serial_no", body.wxpay_serial_no.trim());
+    if (typeof body.wxpay_public_key === "string") {
+      const trimmedPub = body.wxpay_public_key.trim();
+      if (trimmedPub) validatePublicKey(trimmedPub);
+      setSetting(database, "wxpay_public_key", trimmedPub ? toSpkiPublicKey(trimmedPub) : "");
+    }
     if (typeof body.wxpay_static_qr_url === "string") setSetting(database, "wxpay_static_qr_url", body.wxpay_static_qr_url.trim());
-    if (typeof body.wxpay_hook_token === "string") setSecret(database, "wxpay_hook_token", body.wxpay_hook_token.trim());
+    if (typeof body.wxpay_hook_token === "string") {
+      const trimmedToken = body.wxpay_hook_token.trim();
+      if (!trimmedToken) {
+        if (!getSecret(database, "wxpay_hook_token")) {
+          setSecret(database, "wxpay_hook_token", randomAlphaNumeric(32));
+        } else {
+          throw new AppError(400, "HOOK_TOKEN_REQUIRED", "为保障资金安全，Hook 鉴权 Token 不能为空");
+        }
+      } else {
+        assert(trimmedToken.length >= 8, 400, "INVALID_HOOK_TOKEN", "Hook 鉴权 Token 长度至少为 8 位");
+        setSecret(database, "wxpay_hook_token", trimmedToken);
+      }
+    }
 
     if (body.collection_mode === "business_qr" || body.collection_mode === "transfer") setSetting(database, "collection_mode", body.collection_mode);
     if (body.transfer_link_layer !== undefined) {
@@ -431,7 +452,8 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
       if (mode === "hook") {
         const qr = getSetting(database, "wxpay_static_qr_url", "");
         assert(qr, 400, "WXPAY_QR_MISSING", "PC Hook 模式尚未上传微信个人/静态收款码");
-        return c.json({ ok: true, message: "PC 微信 Hook 模式已就绪（收款码已上传）" });
+        assert(getSecret(database, "wxpay_hook_token"), 400, "WXPAY_HOOK_TOKEN_MISSING", "PC Hook 模式尚未配置鉴权 Token");
+        return c.json({ ok: true, message: "PC 微信 Hook 模式已就绪（收款码及 Token 已配置）" });
       }
       wechatService.getCredentials();
       return c.json({ ok: true, message: "微信支付证书及 API 密钥验证通过" });
@@ -472,7 +494,9 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
       setSecret(database, "wxpay_api_v3_key", body.api_v3_key.trim());
     }
     if (body.hook_token !== undefined) {
-      setSecret(database, "wxpay_hook_token", body.hook_token.trim());
+      const trimmedToken = body.hook_token.trim();
+      assert(trimmedToken.length >= 8, 400, "INVALID_HOOK_TOKEN", "Hook 鉴权 Token 长度至少为 8 位且不能为空");
+      setSecret(database, "wxpay_hook_token", trimmedToken);
     }
     audit(database, "keys.wxpay_secrets", { actor: c.get("admin").username });
     return c.json({ ok: true });
@@ -524,6 +548,12 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
     assert(user && (await verifyPassword(body.current_password, user.password_hash)), 400, "CURRENT_PASSWORD_INCORRECT", "当前密码不正确");
     const newHash = await createPasswordHash(body.new_password);
     database.query("UPDATE admin_users SET password_hash = ?, updated_at = ? WHERE id = ?").run(newHash, new Date().toISOString(), c.get("admin").id);
+    const currentToken = getCookie(c, SESSION_COOKIE) ?? getCookie(c, "alimpay_session") ?? "";
+    if (currentToken) {
+      database.query("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?").run(c.get("admin").id, sha256(currentToken));
+    } else {
+      database.query("DELETE FROM sessions WHERE user_id = ?").run(c.get("admin").id);
+    }
     audit(database, "system.password_changed", { actor: c.get("admin").username, ip: clientIp(c.req.raw.headers) });
     return c.json({ ok: true });
   };

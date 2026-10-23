@@ -24,11 +24,32 @@ interface LoginBucket {
   blockedUntil: number;
 }
 
+const MAX_LOGIN_BUCKETS = 10_000;
 const loginBuckets = new Map<string, LoginBucket>();
+
+function pruneLoginBuckets(now: number) {
+  if (loginBuckets.size < MAX_LOGIN_BUCKETS) return;
+  for (const [key, bucket] of loginBuckets) {
+    const activeFailures = bucket.failures.filter((time) => now - time < 15 * 60_000);
+    if (activeFailures.length === 0 && bucket.blockedUntil <= now) {
+      loginBuckets.delete(key);
+    }
+  }
+  if (loginBuckets.size >= MAX_LOGIN_BUCKETS) {
+    const oldestKey = loginBuckets.keys().next().value;
+    if (oldestKey !== undefined) loginBuckets.delete(oldestKey);
+  }
+}
 
 export function clientIp(headers: Headers) {
   if (getRuntimeEnv().trustProxy) {
-    return (headers.get("cf-connecting-ip") ?? headers.get("x-forwarded-for")?.split(",")[0] ?? headers.get("x-real-ip") ?? "").trim().slice(0, 128);
+    const trustCloudflare = process.env.TRUST_CLOUDFLARE === "1" || process.env.TRUST_CLOUDFLARE?.toLowerCase() === "true";
+    const cfIp = trustCloudflare ? headers.get("cf-connecting-ip") : null;
+    const xff = headers.get("x-forwarded-for");
+    const forwardedIp = xff
+      ? xff.split(",").map((part) => part.trim()).filter(Boolean).at(-1)
+      : null;
+    return (cfIp ?? headers.get("x-real-ip") ?? forwardedIp ?? "").trim().slice(0, 128);
   }
   return "";
 }
@@ -69,16 +90,17 @@ export function checkLoginRateLimit(key: string) {
   const now = Date.now();
   const bucket = loginBuckets.get(key);
   if (bucket?.blockedUntil && bucket.blockedUntil > now) {
-    throw new AppError(429, "LOGIN_RATE_LIMITED", "登录尝试过多，请稍后再试");
+    throw new AppError(429, "LOGIN_RATE_LIMITED", "尝试次数过多，请稍后再试");
   }
 }
 
-export function recordLoginFailure(key: string) {
+export function recordLoginFailure(key: string, maxFailures = 5) {
   const now = Date.now();
+  pruneLoginBuckets(now);
   const bucket = loginBuckets.get(key) ?? { failures: [], blockedUntil: 0 };
   bucket.failures = bucket.failures.filter((time) => now - time < 15 * 60_000);
   bucket.failures.push(now);
-  if (bucket.failures.length >= 5) bucket.blockedUntil = now + 15 * 60_000;
+  if (bucket.failures.length >= maxFailures) bucket.blockedUntil = now + 15 * 60_000;
   loginBuckets.set(key, bucket);
 }
 

@@ -99,6 +99,7 @@ export interface PublicSettings {
   wxpay_app_id: string;
   wxpay_mch_id: string;
   wxpay_serial_no: string;
+  wxpay_public_key?: string;
   wxpay_configured: boolean;
   wxpay_static_qr_url: string;
   wxpay_hook_token_configured: boolean;

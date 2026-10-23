@@ -103,6 +103,12 @@ export async function createOrder(
   const nowMs = Date.now();
   const now = new Date(nowMs).toISOString();
 
+  let id = "";
+  let tradeNo = "";
+  let collectionMode!: CollectionMode;
+  let payableAmountCents = input.requestedAmountCents;
+  let channelQrPayload: string | null = null;
+
   database.exec("BEGIN IMMEDIATE");
   try {
     expireOrders(database, now);
@@ -116,10 +122,6 @@ export async function createOrder(
       database.exec("COMMIT");
       return { order: duplicate, reused: true };
     }
-
-    let collectionMode: CollectionMode;
-    let payableAmountCents = input.requestedAmountCents;
-    let channelQrPayload: string | null = null;
 
     if (input.type === "alipay") {
       assert(getSetting(database, "alipay_enabled", true), 403, "ALIPAY_DISABLED", "支付宝支付渠道已关闭");
@@ -175,6 +177,7 @@ export async function createOrder(
       } else {
         collectionMode = "wxpay_hook";
         assert(getSetting(database, "wxpay_static_qr_url", ""), 503, "WXPAY_QR_MISSING", "微信收款码尚未上传");
+        assert(getSecret(database, "wxpay_hook_token"), 503, "WXPAY_HOOK_TOKEN_MISSING", "微信 Hook 鉴权 Token 尚未配置");
       }
     }
 
@@ -194,8 +197,8 @@ export async function createOrder(
       assert(allocated, 429, "AMOUNT_POOL_EXHAUSTED", "当前相同金额的待支付订单过多，请稍后重试");
     }
 
-    const id = crypto.randomUUID();
-    const tradeNo = createTradeNo();
+    id = crypto.randomUUID();
+    tradeNo = createTradeNo();
     const checkoutToken = randomToken(24);
     const expiresAt = utcAfter(5 * 60_000, nowMs);
     const monitorUntil = utcAfter(7 * 60_000, nowMs);
@@ -203,48 +206,7 @@ export async function createOrder(
     delete rawRequest.sign;
     delete rawRequest.key;
 
-    // Upstream Prepay for F2F or WeChat Native
-    if (collectionMode === "alipay_f2f") {
-      const alipayProvider = services?.alipay ?? new OfficialAlipayProvider(database);
-      if (getRuntimeEnv().nodeEnv === "test" && getSetting(database, "alipay_app_id", "").startsWith("2026")) {
-        channelQrPayload = `https://qr.alipay.com/bax${tradeNo}`;
-      } else {
-        try {
-          const res = await alipayProvider.precreateTrade({
-            outTradeNo: tradeNo,
-            totalAmount: centsToMoney(payableAmountCents),
-            subject: input.name,
-          });
-          channelQrPayload = res.qrCode;
-        } catch (err: unknown) {
-          if (getRuntimeEnv().nodeEnv === "test") {
-            channelQrPayload = `https://qr.alipay.com/bax${tradeNo}`;
-          } else {
-            throw err;
-          }
-        }
-      }
-    } else if (collectionMode === "wxpay_native") {
-      const wechatService = services?.wechat ?? new WeChatPayService(database);
-      if (getRuntimeEnv().nodeEnv === "test" && getSetting(database, "wxpay_app_id", "").startsWith("wx_test")) {
-        channelQrPayload = `weixin://wxpay/bizpayurl?pr=${tradeNo}`;
-      } else {
-        try {
-          const res = await wechatService.nativePrepay({
-            outTradeNo: tradeNo,
-            totalCents: payableAmountCents,
-            description: input.name,
-          });
-          channelQrPayload = res.codeUrl;
-        } catch (err: unknown) {
-          if (getRuntimeEnv().nodeEnv === "test") {
-            channelQrPayload = `weixin://wxpay/bizpayurl?pr=${tradeNo}`;
-          } else {
-            throw err;
-          }
-        }
-      }
-    } else if (collectionMode === "business_qr") {
+    if (collectionMode === "business_qr") {
       channelQrPayload = getSetting(database, "business_qr_raw", "") || getSetting(database, "business_qr_url", "");
     } else if (collectionMode === "wxpay_hook") {
       channelQrPayload = getSetting(database, "wxpay_static_qr_url", "");
@@ -273,14 +235,65 @@ export async function createOrder(
       `).run(crypto.randomUUID(), id, payableAmountCents, monitorUntil, now);
     }
 
-    const order = getOrderById(database, id);
-    if (!order) throw new Error("订单写入后无法读取");
     database.exec("COMMIT");
-    return { order, reused: false };
   } catch (error) {
     database.exec("ROLLBACK");
     throw error;
   }
+
+  // Upstream Prepay for F2F or WeChat Native outside SQLite write transaction
+  try {
+    if (collectionMode === "alipay_f2f") {
+      const alipayProvider = services?.alipay ?? new OfficialAlipayProvider(database);
+      if (getRuntimeEnv().nodeEnv === "test" && getSetting(database, "alipay_app_id", "").startsWith("2026")) {
+        channelQrPayload = `https://qr.alipay.com/bax${tradeNo}`;
+      } else {
+        try {
+          const res = await alipayProvider.precreateTrade({
+            outTradeNo: tradeNo,
+            totalAmount: centsToMoney(payableAmountCents),
+            subject: input.name,
+          });
+          channelQrPayload = res.qrCode;
+        } catch (err: unknown) {
+          if (getRuntimeEnv().nodeEnv === "test") {
+            channelQrPayload = `https://qr.alipay.com/bax${tradeNo}`;
+          } else {
+            throw err;
+          }
+        }
+      }
+      database.query("UPDATE orders SET channel_qr_payload = ? WHERE id = ?").run(channelQrPayload, id);
+    } else if (collectionMode === "wxpay_native") {
+      const wechatService = services?.wechat ?? new WeChatPayService(database);
+      if (getRuntimeEnv().nodeEnv === "test" && getSetting(database, "wxpay_app_id", "").startsWith("wx_test")) {
+        channelQrPayload = `weixin://wxpay/bizpayurl?pr=${tradeNo}`;
+      } else {
+        try {
+          const res = await wechatService.nativePrepay({
+            outTradeNo: tradeNo,
+            totalCents: payableAmountCents,
+            description: input.name,
+          });
+          channelQrPayload = res.codeUrl;
+        } catch (err: unknown) {
+          if (getRuntimeEnv().nodeEnv === "test") {
+            channelQrPayload = `weixin://wxpay/bizpayurl?pr=${tradeNo}`;
+          } else {
+            throw err;
+          }
+        }
+      }
+      database.query("UPDATE orders SET channel_qr_payload = ? WHERE id = ?").run(channelQrPayload, id);
+    }
+  } catch (error) {
+    database.query("DELETE FROM orders WHERE id = ?").run(id);
+    throw error;
+  }
+
+  const order = getOrderById(database, id);
+  if (!order) throw new Error("订单写入后无法读取");
+  return { order, reused: false };
 }
 
 export function expireOrders(database: AppDatabase, now = new Date().toISOString()) {

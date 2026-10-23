@@ -1,7 +1,7 @@
 import { Hono, type Context } from "hono";
 import type { OrderRecord, TransferLinkLayer } from "../shared/contracts";
 import type { PaymentScanner } from "./alipay";
-import { clientIp } from "./auth";
+import { checkLoginRateLimit, clearLoginFailures, clientIp, recordLoginFailure } from "./auth";
 import { getSecret } from "./config";
 import { getSetting, type AppDatabase } from "./db";
 import { AppError, assert } from "./errors";
@@ -368,7 +368,9 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
   // WeChat Pay APIv3 Official Webhook Callback
   app.post("/api/pay/wechat/notify", async (c) => {
     try {
-      const body = ((await c.req.json().catch(() => ({}))) ?? {}) as Record<string, unknown>;
+      const rawBody = await c.req.text();
+      wechatService.verifyNotificationSignature(c.req.raw.headers, rawBody);
+      const body = (JSON.parse(rawBody || "{}") ?? {}) as Record<string, unknown>;
       const resource = (body.resource ?? {}) as Record<string, string>;
       if (resource.ciphertext && resource.nonce) {
         const decrypted = wechatService.decryptNotification(
@@ -376,11 +378,23 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
           resource.nonce,
           resource.associated_data ?? "",
         );
+        const expectedMchId = getSetting(database, "wxpay_mch_id", "").trim();
+        const expectedAppId = getSetting(database, "wxpay_app_id", "").trim();
+        if (expectedMchId && String(decrypted.mchid ?? "") !== expectedMchId) {
+          return c.json({ code: "FAIL", message: "商户号不匹配" }, 400);
+        }
+        if (expectedAppId && String(decrypted.appid ?? "") !== expectedAppId) {
+          return c.json({ code: "FAIL", message: "AppID 不匹配" }, 400);
+        }
         const outTradeNo = String(decrypted.out_trade_no ?? "");
         const tradeState = String(decrypted.trade_state ?? "");
         if (tradeState === "SUCCESS" && outTradeNo) {
           const order = database.query("SELECT * FROM orders WHERE type = 'wxpay' AND (trade_no = ? OR out_trade_no = ?)").get(outTradeNo, outTradeNo) as OrderRecord | null;
           if (order) {
+            const paidCents = Number((decrypted.amount as Record<string, unknown> | undefined)?.total);
+            if (!Number.isInteger(paidCents) || paidCents !== order.payable_amount_cents) {
+              return c.json({ code: "FAIL", message: "支付金额不匹配" }, 400);
+            }
             markOrderPaidDirectly(database, order.id, {
               channel: "wxpay",
               channelOrderId: String(decrypted.transaction_id ?? ""),
@@ -391,47 +405,56 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
         }
       }
       return c.json({ code: "SUCCESS", message: "成功" });
-    } catch {
+    } catch (error) {
+      if (error instanceof AppError && error.status === 401) {
+        return c.json({ code: "FAIL", message: error.message }, 401);
+      }
       return c.json({ code: "FAIL", message: "失败" }, 500);
     }
   });
 
   // PC WeChat Hook endpoint health check & connectivity diagnostics
   app.get("/api/hook/receive", async (c) => {
+    const ip = clientIp(c.req.raw.headers) || "unknown";
+    const rateKey = `hook:${ip}`;
+    checkLoginRateLimit(rateKey);
+
     const queryToken = c.req.query("token") ?? "";
     const headerToken = c.req.header("x-hook-token") ?? c.req.header("authorization")?.replace(/^Bearer\s+/i, "") ?? "";
     const token = (queryToken || headerToken).trim();
     const expectedToken = getSecret(database, "wxpay_hook_token");
 
-    if (expectedToken) {
-      if (!token) {
-        return c.json({
-          code: 0,
-          status: "pending_auth",
-          msg: "ApusPay Hook 接口就绪（已启用 Token 保护，请求时请附带 ?token=xxx 或 X-Hook-Token 请求头）",
-          authenticated: false,
-        });
-      }
-      if (!checkHookTokenMatch(token, expectedToken)) {
-        return c.json({
-          code: -1,
-          status: "unauthorized",
-          msg: "Hook 鉴权失败：提供的 Token 与服务端配置不一致",
-          authenticated: false,
-        }, 401);
-      }
+    if (!expectedToken) {
       return c.json({
-        code: 1,
-        status: "ok",
-        msg: "ApusPay Hook 接口就绪，Token 鉴权通过",
-        authenticated: true,
-      });
+        code: -1,
+        status: "unconfigured",
+        msg: "服务尚未配置 wxpay_hook_token，请先在管理后台设置 Hook 鉴权 Token",
+        authenticated: false,
+      }, 503);
     }
 
+    if (!token) {
+      return c.json({
+        code: 0,
+        status: "pending_auth",
+        msg: "ApusPay Hook 接口就绪（已启用 Token 保护，请求时请附带 X-Hook-Token 请求头）",
+        authenticated: false,
+      });
+    }
+    if (!checkHookTokenMatch(token, expectedToken)) {
+      recordLoginFailure(rateKey);
+      return c.json({
+        code: -1,
+        status: "unauthorized",
+        msg: "Hook 鉴权失败：提供的 Token 与服务端配置不一致",
+        authenticated: false,
+      }, 401);
+    }
+    clearLoginFailures(rateKey);
     return c.json({
       code: 1,
       status: "ok",
-      msg: "ApusPay Hook 接口就绪（当前未配置 wxpay_hook_token，无需鉴权）",
+      msg: "ApusPay Hook 接口就绪，Token 鉴权通过",
       authenticated: true,
     });
   });
@@ -439,26 +462,31 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
   // PC WeChat Hook / SweetCheckout Hook receiver
   app.post("/api/hook/receive", async (c) => {
     try {
+      const ip = clientIp(c.req.raw.headers) || "unknown";
+      const rateKey = `hook:${ip}`;
+      checkLoginRateLimit(rateKey);
+
       const body = ((await c.req.json().catch(() => ({}))) ?? {}) as Record<string, unknown>;
       const type = String(body.type ?? "wechat").toLowerCase();
       const money = String(body.money ?? "").trim();
       const queryToken = c.req.query("token") ?? "";
       const headerToken = c.req.header("x-hook-token") ?? c.req.header("authorization")?.replace(/^Bearer\s+/i, "") ?? "";
       const token = String(body.token ?? (queryToken || headerToken)).trim();
-      const ip = clientIp(c.req.raw.headers) || "unknown";
       const ua = c.req.header("user-agent") || "unknown";
 
       console.info(`[Hook] 收到 Hook 回调请求: type=${type}, money=${money}, ua=${ua}, ip=${ip}, has_token=${Boolean(token)}`);
 
       const expectedToken = getSecret(database, "wxpay_hook_token");
-      if (expectedToken) {
-        if (!checkHookTokenMatch(token, expectedToken)) {
-          console.warn(`[Hook] Token 鉴权失败: 来源 IP=${ip}`);
-          return c.json({ code: -1, msg: "invalid hook token" }, 401);
-        }
-      } else {
-        console.warn(`[Hook] 警告: 未配置 wxpay_hook_token，当前 Hook 接口无鉴权防护！来源 IP=${ip}`);
+      if (!expectedToken) {
+        console.error(`[Hook] 拒绝请求: 尚未配置 wxpay_hook_token (来源 IP=${ip})`);
+        return c.json({ code: -1, msg: "hook token not configured" }, 503);
       }
+      if (!checkHookTokenMatch(token, expectedToken)) {
+        recordLoginFailure(rateKey);
+        console.warn(`[Hook] Token 鉴权失败: 来源 IP=${ip}`);
+        return c.json({ code: -1, msg: "invalid hook token" }, 401);
+      }
+      clearLoginFailures(rateKey);
 
       if (!money) {
         return c.json({ code: -1, msg: "missing money" }, 400);
@@ -514,6 +542,9 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
         out_trade_no: candidate.out_trade_no,
       });
     } catch (error) {
+      if (error instanceof AppError) {
+        return c.json({ code: -1, msg: error.message }, error.status as 400 | 401 | 403 | 429 | 500 | 503);
+      }
       console.error(`[Hook] 处理回调异常:`, error);
       return c.json({ code: -1, msg: errorMessage(error) }, 500);
     }

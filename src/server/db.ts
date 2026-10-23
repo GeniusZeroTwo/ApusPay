@@ -170,6 +170,7 @@ const DEFAULT_SETTINGS: Record<string, unknown> = {
   wxpay_app_id: "",
   wxpay_mch_id: "",
   wxpay_serial_no: "",
+  wxpay_public_key: "",
   wxpay_static_qr_url: "",
   // EasyPay
   v1_enabled: true,

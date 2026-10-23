@@ -173,4 +173,44 @@ describe("admin session and CSRF", () => {
     });
     expect(adminLogin.status).toBe(200);
   });
+
+  it("revokes other sessions when password is changed", async () => {
+    ({ database } = configuredDatabase());
+    const now = new Date().toISOString();
+    const userId = crypto.randomUUID();
+    const { createPasswordHash } = await import("../src/server/auth");
+    const hash = await createPasswordHash("old-password-123456");
+    database.query("INSERT INTO admin_users(id, username, password_hash, created_at, updated_at) VALUES (?, 'admin', ?, ?, ?)").run(userId, hash, now, now);
+
+    const exp = new Date(Date.now() + 60_000).toISOString();
+    database.query("INSERT INTO sessions(id, user_id, token_hash, expires_at, created_at, last_seen_at, ip, user_agent) VALUES (?, ?, ?, ?, ?, ?, '', '')").run(crypto.randomUUID(), userId, sha256("current-session"), exp, now, now);
+    database.query("INSERT INTO sessions(id, user_id, token_hash, expires_at, created_at, last_seen_at, ip, user_agent) VALUES (?, ?, ?, ?, ?, ?, '', '')").run(crypto.randomUUID(), userId, sha256("other-session"), exp, now, now);
+
+    const scanner = new PaymentScanner(database, new EmptyProvider());
+    const { app } = createApp({ database, scanner, notifications: new NotificationWorker(database, fetch) });
+
+    const changeRes = await app.request("http://localhost/admin-api/system/password", {
+      method: "POST",
+      headers: {
+        cookie: "apuspay_session=current-session; apuspay_csrf=csrf-token",
+        "x-csrf-token": "csrf-token",
+        origin: "http://localhost",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ current_password: "old-password-123456", new_password: "new-password-123456" }),
+    });
+    expect(changeRes.status).toBe(200);
+
+    // Current session stays valid
+    const currentMe = await app.request("http://localhost/admin-api/me", {
+      headers: { cookie: "apuspay_session=current-session; apuspay_csrf=csrf-token" },
+    });
+    expect(currentMe.status).toBe(200);
+
+    // Other session is revoked
+    const otherMe = await app.request("http://localhost/admin-api/me", {
+      headers: { cookie: "apuspay_session=other-session; apuspay_csrf=csrf-token" },
+    });
+    expect(otherMe.status).toBe(401);
+  });
 });

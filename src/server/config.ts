@@ -50,7 +50,7 @@ export function getPublicSettings(database: AppDatabase): PublicSettings {
   );
 
   const wxpayConfigured = wxpayMode === "hook"
-    ? Boolean(getSetting(database, "wxpay_static_qr_url", ""))
+    ? Boolean(getSetting(database, "wxpay_static_qr_url", "") && getSecret(database, "wxpay_hook_token"))
     : Boolean(
         getSetting(database, "wxpay_app_id", "") &&
         getSetting(database, "wxpay_mch_id", "") &&
@@ -80,6 +80,7 @@ export function getPublicSettings(database: AppDatabase): PublicSettings {
     wxpay_app_id: getSetting(database, "wxpay_app_id", ""),
     wxpay_mch_id: getSetting(database, "wxpay_mch_id", ""),
     wxpay_serial_no: getSetting(database, "wxpay_serial_no", ""),
+    wxpay_public_key: getSetting(database, "wxpay_public_key", ""),
     wxpay_configured: wxpayConfigured,
     wxpay_static_qr_url: getSetting(database, "wxpay_static_qr_url", ""),
     wxpay_hook_token_configured: Boolean(getSecret(database, "wxpay_hook_token")),
