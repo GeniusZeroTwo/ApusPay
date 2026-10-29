@@ -23,8 +23,8 @@ permissions:
   contents: write
 
 jobs:
-  test-allpay:
-    name: Test & Build AllPay Server
+  test-apuspay:
+    name: Test & Build ApusPay Server
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
@@ -79,7 +79,7 @@ jobs:
           nuget restore Hook.sln
           msbuild Hook.sln /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion="10.0"
 
-          Set-Content -Path Out/config.properties -Value "# AllPay 微信 PC Hook 方案 B 配置文件`r`n# 适用微信版本：3.9.12.51`r`n# Hook 接收端点地址（若网关后台设置了通信 Token，追加 ?token=xxx）`r`napi_url=http://127.0.0.1:3000/api/hook/receive`r`n"
+          Set-Content -Path Out/config.properties -Value "# ApusPay 微信 PC Hook 方案 B 配置文件`r`n# 适用微信版本：3.9.12.51`r`n# Hook 接收端点地址（若网关后台设置了通信 Token，追加 ?token=xxx）`r`napi_url=http://127.0.0.1:3000/api/hook/receive`r`n"
           Copy-Item LICENSE Out/LICENSE
           if (Test-Path README.md) { Copy-Item README.md Out/使用说明.md }
           cd Out
@@ -92,7 +92,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path Out
           cmd /c build.cmd
 
-          Set-Content -Path Out/config.properties -Value "# AllPay 微信 PC Hook 方案 A 配置文件`r`n# 适用微信版本：4.1.0.34 ~ 4.1.2.17`r`n# Hook 接收端点地址（若网关后台设置了通信 Token，追加 ?token=xxx）`r`napi_url=http://127.0.0.1:3000/api/hook/receive`r`nwechat_key=`r`ndatabase_folder=auto`r`n# 是否启用 Cloudflare 内存级优选直连（true/false，彻底解决小云朵国内连接被掐断/10054重置问题）`r`ncf_optimize=true`r`n# 手动指定 Cloudflare 优选 IP（留空则全自动测速选取最低延迟节点）`r`ncf_ip=`r`n"
+          Set-Content -Path Out/config.properties -Value "# ApusPay 微信 PC Hook 方案 A 配置文件`r`n# 适用微信版本：4.1.0.34 ~ 4.1.2.17`r`n# Hook 接收端点地址（若网关后台设置了通信 Token，追加 ?token=xxx）`r`napi_url=http://127.0.0.1:3000/api/hook/receive`r`nwechat_key=`r`ndatabase_folder=auto`r`n# 是否启用 Cloudflare 内存级优选直连（true/false，彻底解决小云朵国内连接被掐断/10054重置问题）`r`ncf_optimize=true`r`n# 手动指定 Cloudflare 优选 IP（留空则全自动测速选取最低延迟节点）`r`ncf_ip=`r`n"
           Copy-Item LICENSE Out/LICENSE
           if (Test-Path README.md) { Copy-Item README.md Out/使用说明.md }
           cd Out
@@ -108,7 +108,7 @@ jobs:
 
   publish-release:
     name: Publish to GitHub Releases
-    needs: [test-allpay, build-hooks]
+    needs: [test-apuspay, build-hooks]
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     runs-on: ubuntu-24.04
     steps:
