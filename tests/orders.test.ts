@@ -143,4 +143,51 @@ describe("payment state machine", () => {
     expect(match).toBe(true);
     expect(getOrderById(database, order.id)?.status).toBe("paid");
   });
+
+  it("releases surcharge reservation on recordAndMatchPayment and isolates non-bill orders", async () => {
+    ({ database } = configuredDatabase("business_qr"));
+    const { setSecret } = await import("../src/server/config");
+    setSecret(database, "wxpay_hook_token", "hook-token-123456");
+    setSetting(database, "wxpay_mode", "hook");
+    setSetting(database, "wxpay_static_qr_url", "http://localhost/uploads/wechat-qr-test.png");
+
+    // 1. Create a wxpay_hook order at 1.00 (100 cents)
+    const wxOrder = (await createOrder(database, { ...orderInput(1), type: "wxpay" })).order;
+    expect(wxOrder.payable_amount_cents).toBe(100);
+
+    // 2. An Alipay bill event for 100 cents MUST NOT match the wxpay_hook order
+    const crossMatch = recordAndMatchPayment(database, {
+      accountLogId: "CROSS-LOG-1",
+      occurredAt: new Date().toISOString(),
+      direction: "收入",
+      amountCents: 100,
+      alipayOrderNo: "ALI-CROSS",
+      transMemo: "",
+      otherAccount: "buyer",
+      raw: {},
+    });
+    expect(crossMatch.matched).toBe(false);
+    expect(getOrderById(database, wxOrder.id)?.status).toBe("pending");
+
+    // 3. Create an Alipay business_qr order at 2.00 (200 cents), pay it via recordAndMatchPayment,
+    // and verify its surcharge reservation slot (200 cents) is immediately freed for the next order
+    const aliOrder1 = (await createOrder(database, { ...orderInput(2), money: "2.00" })).order;
+    expect(aliOrder1.payable_amount_cents).toBe(200);
+
+    const aliMatch = recordAndMatchPayment(database, {
+      accountLogId: "ALI-LOG-200",
+      occurredAt: new Date().toISOString(),
+      direction: "收入",
+      amountCents: 200,
+      alipayOrderNo: "ALI-OK-200",
+      transMemo: "",
+      otherAccount: "buyer",
+      raw: {},
+    });
+    expect(aliMatch.matched).toBe(true);
+    expect(getOrderById(database, aliOrder1.id)?.status).toBe("paid");
+
+    const aliOrder2 = (await createOrder(database, { ...orderInput(3), money: "2.00" })).order;
+    expect(aliOrder2.payable_amount_cents).toBe(200);
+  });
 });

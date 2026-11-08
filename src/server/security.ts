@@ -6,13 +6,20 @@ import {
   createPublicKey,
   createSign,
   createVerify,
+  generateKeyPair,
   generateKeyPairSync,
+  type KeyObject,
   randomBytes,
   randomInt,
   timingSafeEqual,
 } from "node:crypto";
-import { isIP } from "node:net";
+import type { LookupAddress } from "node:dns";
 import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
+import { promisify } from "node:util";
+import { AppError } from "./errors";
+
+const generateKeyPairAsync = promisify(generateKeyPair);
 
 const OMIT_FROM_SIGNATURE = new Set(["sign", "sign_type"]);
 
@@ -60,8 +67,49 @@ export interface RsaKeyPair {
   publicKey: string;
 }
 
+const MAX_KEY_CACHE_SIZE = 64;
+const privateKeyCache = new Map<string, KeyObject>();
+const publicKeyCache = new Map<string, KeyObject>();
+
+export function getCachedPrivateKey(value: string): KeyObject {
+  const pem = normalizePem(value, "private");
+  const hit = privateKeyCache.get(pem);
+  if (hit) return hit;
+  const parsed = createPrivateKey(pem);
+  if (privateKeyCache.size >= MAX_KEY_CACHE_SIZE) {
+    const oldest = privateKeyCache.keys().next().value;
+    if (oldest !== undefined) privateKeyCache.delete(oldest);
+  }
+  privateKeyCache.set(pem, parsed);
+  return parsed;
+}
+
+export function getCachedPublicKey(value: string): KeyObject {
+  const clean = value.trim().replace(/\r/g, "");
+  const pem = clean.includes("-----BEGIN CERTIFICATE-----") ? `${clean}\n` : normalizePem(clean, "public");
+  const hit = publicKeyCache.get(pem);
+  if (hit) return hit;
+  const parsed = createPublicKey(pem);
+  if (publicKeyCache.size >= MAX_KEY_CACHE_SIZE) {
+    const oldest = publicKeyCache.keys().next().value;
+    if (oldest !== undefined) publicKeyCache.delete(oldest);
+  }
+  publicKeyCache.set(pem, parsed);
+  return parsed;
+}
+
 export function generateRsaKeyPair(): RsaKeyPair {
   const pair = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    publicExponent: 0x10001,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  return { privateKey: pair.privateKey, publicKey: pair.publicKey };
+}
+
+export async function generateRsaKeyPairAsync(): Promise<RsaKeyPair> {
+  const pair = await generateKeyPairAsync("rsa", {
     modulusLength: 2048,
     publicExponent: 0x10001,
     privateKeyEncoding: { type: "pkcs8", format: "pem" },
@@ -74,7 +122,7 @@ export function rsaSign(parameters: Record<string, unknown>, privateKey: string)
   const signer = createSign("RSA-SHA256");
   signer.update(canonicalize(parameters), "utf8");
   signer.end();
-  return signer.sign({ key: createPrivateKey(normalizePem(privateKey, "private")), padding: 1 }, "base64");
+  return signer.sign({ key: getCachedPrivateKey(privateKey), padding: 1 }, "base64");
 }
 
 export function rsaVerify(parameters: Record<string, unknown>, publicKey: string) {
@@ -84,7 +132,7 @@ export function rsaVerify(parameters: Record<string, unknown>, publicKey: string
     verifier.update(canonicalize(parameters), "utf8");
     verifier.end();
     return verifier.verify(
-      { key: createPublicKey(normalizePem(publicKey, "public")), padding: 1 },
+      { key: getCachedPublicKey(publicKey), padding: 1 },
       parameters.sign,
       "base64",
     );
@@ -94,19 +142,19 @@ export function rsaVerify(parameters: Record<string, unknown>, publicKey: string
 }
 
 export function validatePrivateKey(value: string) {
-  createPrivateKey(normalizePem(value, "private"));
+  getCachedPrivateKey(value);
 }
 
 export function validatePublicKey(value: string) {
-  createPublicKey(normalizePem(value, "public"));
+  getCachedPublicKey(value);
 }
 
 export function toPkcs8PrivateKey(value: string) {
-  return createPrivateKey(normalizePem(value, "private")).export({ type: "pkcs8", format: "pem" }).toString();
+  return getCachedPrivateKey(value).export({ type: "pkcs8", format: "pem" }).toString();
 }
 
 export function toSpkiPublicKey(value: string) {
-  return createPublicKey(normalizePem(value, "public")).export({ type: "spki", format: "pem" }).toString();
+  return getCachedPublicKey(value).export({ type: "spki", format: "pem" }).toString();
 }
 
 export function encryptSecret(plaintext: string, masterKey: Buffer) {
@@ -156,10 +204,14 @@ export function randomAlphaNumeric(length: number) {
 
 export function parseMoneyToCents(value: unknown) {
   const raw = String(value ?? "").trim();
-  if (!/^(0|[1-9]\d{0,7})(\.\d{1,2})?$/.test(raw)) throw new Error("金额格式错误，必须是最多两位小数的正数");
+  if (!/^(0|[1-9]\d{0,7})(\.\d{1,2})?$/.test(raw)) {
+    throw new AppError(400, "INVALID_MONEY", "金额格式错误，必须是最多两位小数的正数");
+  }
   const [yuan, fraction = ""] = raw.split(".");
   const cents = Number(yuan) * 100 + Number(fraction.padEnd(2, "0"));
-  if (!Number.isSafeInteger(cents) || cents <= 0) throw new Error("金额必须大于 0");
+  if (!Number.isSafeInteger(cents) || cents <= 0) {
+    throw new AppError(400, "INVALID_MONEY", "金额必须大于 0");
+  }
   return cents;
 }
 
@@ -189,18 +241,22 @@ export function validateCallbackUrl(value: string, allowPrivate: boolean, allowe
   try {
     url = new URL(value);
   } catch {
-    throw new Error("回调地址不是有效 URL");
+    throw new AppError(400, "INVALID_CALLBACK_URL", "回调地址不是有效 URL");
   }
-  if (!['http:', 'https:'].includes(url.protocol)) throw new Error("回调地址只允许 HTTP/HTTPS");
-  if (url.username || url.password) throw new Error("回调地址不能包含用户名或密码");
+  if (!["http:", "https:"].includes(url.protocol)) {
+    throw new AppError(400, "INVALID_CALLBACK_URL", "回调地址只允许 HTTP/HTTPS");
+  }
+  if (url.username || url.password) {
+    throw new AppError(400, "INVALID_CALLBACK_URL", "回调地址不能包含用户名或密码");
+  }
   if (url.port) {
     const portNum = Number.parseInt(url.port, 10);
     if (!Number.isInteger(portNum) || portNum <= 0 || portNum > 65535 || DANGEROUS_PORTS.has(portNum)) {
-      throw new Error("回调地址端口受限或不安全");
+      throw new AppError(400, "INVALID_CALLBACK_URL", "回调地址端口受限或不安全");
     }
   }
   if (!allowPrivate && !isAllowedCallbackHost(url.hostname, allowedHosts) && isPrivateHostname(url.hostname)) {
-    throw new Error("回调地址不能指向本机或私有网络");
+    throw new AppError(400, "PRIVATE_CALLBACK_FORBIDDEN", "回调地址不能指向本机或私有网络");
   }
   return url;
 }
@@ -211,16 +267,35 @@ function isPrivateHostname(hostname: string) {
   return isIP(normalized) > 0 && isPrivateAddress(normalized);
 }
 
+function ipv4FromGroups(hi: number, lo: number) {
+  return `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`;
+}
+
 export function isPrivateAddress(address: string): boolean {
   const value = address.toLowerCase().replace(/^\[|\]$/g, "");
   if (value.includes(":")) {
     const groups = expandIpv6(value);
     if (!groups) return true;
-    if (groups.every((group) => group === 0) || groups.slice(0, 7).every((group) => group === 0) && groups[7] === 1) return true;
+    // Unspecified (::) or Loopback (::1)
+    if (groups.every((group) => group === 0) || (groups.slice(0, 7).every((group) => group === 0) && groups[7] === 1)) return true;
+    // Unique local (fc00::/7), link-local (fe80::/10), multicast (ff00::/8)
     if ((groups[0]! & 0xfe00) === 0xfc00 || (groups[0]! & 0xffc0) === 0xfe80 || (groups[0]! & 0xff00) === 0xff00) return true;
-    if (groups[0] === 0x2001 && groups[1] === 0x0db8) return true;
-    if (groups.slice(0, 5).every((group) => group === 0) && groups[5] === 0xffff) {
-      return isPrivateAddress(`${groups[6]! >> 8}.${groups[6]! & 0xff}.${groups[7]! >> 8}.${groups[7]! & 0xff}`);
+    // Documentation (2001:db8::/32) and Teredo (2001:0000::/32)
+    if (groups[0] === 0x2001 && (groups[1] === 0x0db8 || groups[1] === 0x0000)) return true;
+    // IPv4-mapped (::ffff:a.b.c.d) or IPv4-compatible (::a.b.c.d)
+    if (groups.slice(0, 5).every((group) => group === 0) && (groups[5] === 0xffff || groups[5] === 0x0000)) {
+      return isPrivateAddress(ipv4FromGroups(groups[6]!, groups[7]!));
+    }
+    // NAT64 Well-Known Prefix (64:ff9b::/96) and Local-Use NAT64 (64:ff9b:1::/48)
+    if (groups[0] === 0x0064 && groups[1] === 0xff9b) {
+      if (groups[2] === 1) return true;
+      if (groups.slice(2, 6).every((group) => group === 0)) {
+        return isPrivateAddress(ipv4FromGroups(groups[6]!, groups[7]!));
+      }
+    }
+    // 6to4 (2002::/16) embedding IPv4 in groups[1..2]
+    if (groups[0] === 0x2002) {
+      return isPrivateAddress(ipv4FromGroups(groups[1]!, groups[2]!));
     }
     return false;
   }
@@ -253,11 +328,28 @@ function expandIpv6(address: string) {
   return groups.length === 8 && groups.every(Number.isFinite) ? groups : null;
 }
 
-export async function assertPublicDestination(url: URL, allowPrivate: boolean, allowedHosts?: string[]) {
-  if (allowPrivate) return;
-  if (isAllowedCallbackHost(url.hostname, allowedHosts)) return;
+export async function resolvePublicDestination(
+  url: URL,
+  allowPrivate: boolean,
+  allowedHosts?: string[],
+): Promise<LookupAddress[] | null> {
+  if (allowPrivate) return null;
+  if (isAllowedCallbackHost(url.hostname, allowedHosts)) return null;
+  const normalizedHost = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const ipFamily = isIP(normalizedHost);
+  if (ipFamily > 0) {
+    if (isPrivateAddress(normalizedHost)) {
+      throw new AppError(400, "PRIVATE_CALLBACK_FORBIDDEN", "回调地址解析到了私有或保留地址");
+    }
+    return [{ address: normalizedHost, family: ipFamily }];
+  }
   const results = await lookup(url.hostname, { all: true, verbatim: true });
   if (results.length === 0 || results.some((result) => isPrivateAddress(result.address))) {
-    throw new Error("回调域名解析到了私有或保留地址");
+    throw new AppError(400, "PRIVATE_CALLBACK_FORBIDDEN", "回调域名解析到了私有或保留地址");
   }
+  return results;
+}
+
+export async function assertPublicDestination(url: URL, allowPrivate: boolean, allowedHosts?: string[]) {
+  await resolvePublicDestination(url, allowPrivate, allowedHosts);
 }

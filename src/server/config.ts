@@ -22,12 +22,40 @@ export const SECRET_SETTING_KEYS = [
 ] as const;
 export type SecretSettingKey = (typeof SECRET_SETTING_KEYS)[number];
 
+interface CachedSecretEntry {
+  envelope: string;
+  masterKeyHex: string;
+  plaintext: string;
+}
+
+const secretCache = new WeakMap<AppDatabase, Map<SecretSettingKey, CachedSecretEntry>>();
+
+function getDatabaseSecretCache(database: AppDatabase) {
+  let cache = secretCache.get(database);
+  if (!cache) {
+    cache = new Map();
+    secretCache.set(database, cache);
+  }
+  return cache;
+}
+
 export function getSecret(database: AppDatabase, key: SecretSettingKey) {
   const encrypted = getSetting<string>(database, key, "");
-  return encrypted ? decryptSecret(encrypted, getRuntimeEnv().masterKey) : "";
+  if (!encrypted) return "";
+  const masterKey = getRuntimeEnv().masterKey;
+  const masterKeyHex = masterKey.toString("hex");
+  const cache = getDatabaseSecretCache(database);
+  const hit = cache.get(key);
+  if (hit && hit.envelope === encrypted && hit.masterKeyHex === masterKeyHex) {
+    return hit.plaintext;
+  }
+  const plaintext = decryptSecret(encrypted, masterKey);
+  cache.set(key, { envelope: encrypted, masterKeyHex, plaintext });
+  return plaintext;
 }
 
 export function setSecret(database: AppDatabase, key: SecretSettingKey, value: string) {
+  secretCache.get(database)?.delete(key);
   setSetting(database, key, value ? encryptSecret(value, getRuntimeEnv().masterKey) : "", true);
 }
 
@@ -98,8 +126,8 @@ export function getPublicSettings(database: AppDatabase): PublicSettings {
   };
 }
 
-export function isGatewayReady(database: AppDatabase) {
-  const settings = getPublicSettings(database);
+export function isGatewayReady(database: AppDatabase, preloadedSettings?: PublicSettings) {
+  const settings = preloadedSettings ?? getPublicSettings(database);
   if (!settings.setup_completed || !settings.merchant_pid) return false;
   const alipayReady = settings.alipay_enabled && settings.alipay_configured;
   const wxpayReady = settings.wxpay_enabled && settings.wxpay_configured;

@@ -80,4 +80,34 @@ describe("shared payment scanner", () => {
     expect((await new PaymentScanner(database, provider).scanNow()).status).toBe("skipped");
     expect(provider.calls).toBe(0);
   });
+
+  it("coalesces and rate-limits direct F2F queries in ensureFresh", async () => {
+    ({ database } = configuredDatabase());
+    setSetting(database, "alipay_mode", "f2f");
+    setSetting(database, "collection_mode", "alipay_f2f");
+    const order = (await createOrder(database, orderInput(1))).order;
+    expect(order.collection_mode).toBe("alipay_f2f");
+
+    let tradeQueries = 0;
+    const f2fProvider: AccountLogProvider = {
+      async query(input) {
+        return { pageNo: input.pageNo, pageSize: input.pageSize, totalSize: 0, traceId: "t", details: [] };
+      },
+      async queryTrade() {
+        tradeQueries += 1;
+        await new Promise((r) => setTimeout(r, 10));
+        return { success: false };
+      },
+    };
+
+    const scanner = new PaymentScanner(database, f2fProvider);
+    // 5 concurrent + immediate back-to-back ensureFresh calls should coalesce/cooldown to 1 upstream call
+    await Promise.all([
+      scanner.ensureFresh(order),
+      scanner.ensureFresh(order),
+      scanner.ensureFresh(order),
+    ]);
+    await scanner.ensureFresh(order);
+    expect(tradeQueries).toBe(1);
+  });
 });

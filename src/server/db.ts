@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES admin_users(id) ON DELETE CASCADE,
   token_hash TEXT NOT NULL UNIQUE,
+  csrf_hash TEXT NOT NULL DEFAULT '',
   expires_at TEXT NOT NULL,
   created_at TEXT NOT NULL,
   last_seen_at TEXT NOT NULL,
@@ -69,6 +70,10 @@ CREATE TABLE IF NOT EXISTS orders (
   UNIQUE(pid, out_trade_no)
 );
 CREATE INDEX IF NOT EXISTS idx_orders_status_monitor ON orders(status, monitor_until);
+CREATE INDEX IF NOT EXISTS idx_orders_status_created ON orders(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_status_expires ON orders(status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_orders_hook_match ON orders(type, collection_mode, status, payable_amount_cents, monitor_until);
+CREATE INDEX IF NOT EXISTS idx_orders_wxpay_trade ON orders(type, trade_no);
 CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_orders_out_trade_no ON orders(out_trade_no);
 
@@ -136,6 +141,7 @@ CREATE TABLE IF NOT EXISTS notification_attempts (
   response_body TEXT,
   error TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_notification_attempts_job ON notification_attempts(job_id, attempt_number ASC);
 
 CREATE TABLE IF NOT EXISTS audit_logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -187,6 +193,8 @@ export function createDatabase(path = getRuntimeEnv().databasePath): AppDatabase
   database.exec("PRAGMA foreign_keys = ON;");
   database.exec("PRAGMA busy_timeout = 5000;");
   database.exec("PRAGMA synchronous = NORMAL;");
+  database.exec("PRAGMA temp_store = MEMORY;");
+  database.exec("PRAGMA cache_size = -16000;");
   database.exec(MIGRATION);
   const now = new Date().toISOString();
   database.query("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)").run(now);
@@ -251,6 +259,30 @@ export function createDatabase(path = getRuntimeEnv().databasePath): AppDatabase
     }
   }
 
+  const securityPerfMigration = database.query("SELECT 1 FROM schema_migrations WHERE version = 5").get();
+  if (!securityPerfMigration) {
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      const sessionColumns = (database.query("PRAGMA table_info(sessions)").all() as Array<{ name: string }>).map((c) => c.name);
+      if (!sessionColumns.includes("csrf_hash")) {
+        database.exec("ALTER TABLE sessions ADD COLUMN csrf_hash TEXT NOT NULL DEFAULT '';");
+      }
+      database.exec(`
+        CREATE INDEX IF NOT EXISTS idx_orders_status_created ON orders(status, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_orders_status_expires ON orders(status, expires_at);
+        CREATE INDEX IF NOT EXISTS idx_orders_hook_match ON orders(type, collection_mode, status, payable_amount_cents, monitor_until);
+        CREATE INDEX IF NOT EXISTS idx_orders_wxpay_trade ON orders(type, trade_no);
+        CREATE INDEX IF NOT EXISTS idx_notification_attempts_job ON notification_attempts(job_id, attempt_number ASC);
+        CREATE INDEX IF NOT EXISTS idx_hook_events_created ON hook_events(created_at);
+      `);
+      database.query("INSERT INTO schema_migrations(version, applied_at) VALUES (5, ?)").run(now);
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   const insert = database.query("INSERT OR IGNORE INTO settings(key, value_json, is_secret, updated_at) VALUES (?, ?, 0, ?)");
   for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) insert.run(key, JSON.stringify(value), now);
   if (!getSetting<string>(database, "public_base_url", "")) {
@@ -260,6 +292,17 @@ export function createDatabase(path = getRuntimeEnv().databasePath): AppDatabase
 }
 
 let singleton: AppDatabase | undefined;
+const MISSING_SETTING = Symbol("missing_setting");
+const settingsCache = new WeakMap<AppDatabase, Map<string, unknown>>();
+
+function getDatabaseSettingsCache(database: AppDatabase) {
+  let cache = settingsCache.get(database);
+  if (!cache) {
+    cache = new Map();
+    settingsCache.set(database, cache);
+  }
+  return cache;
+}
 
 export function getDatabase() {
   singleton ??= createDatabase();
@@ -272,10 +315,20 @@ export function closeDatabase() {
 }
 
 export function getSetting<T>(database: AppDatabase, key: string, fallback: T): T {
+  const cache = getDatabaseSettingsCache(database);
+  if (cache.has(key)) {
+    const cachedValue = cache.get(key);
+    return cachedValue === MISSING_SETTING ? fallback : (cachedValue as T);
+  }
   const row = database.query("SELECT value_json FROM settings WHERE key = ?").get(key) as { value_json: string } | null;
-  if (!row) return fallback;
+  if (!row) {
+    cache.set(key, MISSING_SETTING);
+    return fallback;
+  }
   try {
-    return JSON.parse(row.value_json) as T;
+    const parsed = JSON.parse(row.value_json) as T;
+    cache.set(key, parsed);
+    return parsed;
   } catch {
     return fallback;
   }
@@ -286,6 +339,8 @@ export function setSetting(database: AppDatabase, key: string, value: unknown, i
     INSERT INTO settings(key, value_json, is_secret, updated_at) VALUES (?, ?, ?, ?)
     ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, is_secret = excluded.is_secret, updated_at = excluded.updated_at
   `).run(key, JSON.stringify(value), isSecret ? 1 : 0, new Date().toISOString());
+  // Invalidate rather than eagerly populating so any transaction ROLLBACK stays consistent.
+  settingsCache.get(database)?.delete(key);
 }
 
 export function queryAll<T>(database: AppDatabase, sql: string, ...bindings: SQLQueryBindings[]) {

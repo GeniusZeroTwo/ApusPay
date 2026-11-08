@@ -1,4 +1,4 @@
-﻿#pragma execution_character_set("utf-8")
+#pragma execution_character_set("utf-8")
 
 #include "MinHook.h"
 #include "framework.h"
@@ -280,7 +280,7 @@ void ListenMessage(PortPath_t* pp)
     }
 
     gIsListening = true;
-    strcat_s(baseUrl, pp->baseUrl);
+    strncpy_s(baseUrl, sizeof(baseUrl), pp->baseUrl, _TRUNCATE);
 }
 
 void UnListenMessage()

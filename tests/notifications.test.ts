@@ -73,4 +73,19 @@ describe("notification delivery", () => {
     new NotificationWorker(database, mock() as unknown as typeof fetch);
     expect((database.query("SELECT status FROM notification_jobs WHERE id = ?").get(jobId) as { status: string }).status).toBe("pending");
   });
+
+  it("caps oversized callback responses and records single-query notification history", async () => {
+    ({ database } = configuredDatabase());
+    const { order, jobId } = await paidOrderAndJob(database);
+    const oversizedPayload = "A".repeat(64 * 1024);
+    const fetcher = mock(async () => new Response(oversizedPayload, { status: 200 })) as unknown as typeof fetch;
+    await new NotificationWorker(database, fetcher).tick();
+
+    const { notificationHistory } = await import("../src/server/notifications");
+    const history = notificationHistory(database, order.id) as Array<{ id: string; attempts_detail: Array<{ response_body: string }> }>;
+    expect(history.length).toBe(1);
+    expect(history[0]?.id).toBe(jobId);
+    expect(history[0]?.attempts_detail.length).toBe(1);
+    expect(history[0]?.attempts_detail[0]?.response_body.length).toBe(500);
+  });
 });

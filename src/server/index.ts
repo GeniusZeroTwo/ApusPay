@@ -1,16 +1,17 @@
 import { existsSync } from "node:fs";
 import { extname, resolve, sep } from "node:path";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { secureHeaders } from "hono/secure-headers";
 import { createAdminRoutes } from "./admin";
 import { PaymentScanner } from "./alipay";
+import { attachSocketIp } from "./auth";
 import { getDatabase, type AppDatabase } from "./db";
 import { createEasyPayRoutes } from "./easypay";
 import { getRuntimeEnv } from "./env";
 import { AppError } from "./errors";
 import { isGatewayReady } from "./config";
-import { NotificationWorker } from "./notifications";
-import { buildSignedReturnUrl } from "./notifications";
+import { NotificationWorker, buildSignedReturnUrl } from "./notifications";
 import { getCheckoutData, getOrderByCheckoutToken } from "./orders";
 
 const ASSET_CONTENT_TYPES: Record<string, string> = {
@@ -24,8 +25,10 @@ const ASSET_CONTENT_TYPES: Record<string, string> = {
   ".jpeg": "image/jpeg",
   ".webp": "image/webp",
   ".woff2": "font/woff2",
-  ".map": "application/json; charset=utf-8",
 };
+
+const CLIENT_ROOT = resolve(process.cwd(), "dist/client");
+let clientRootReady = false;
 
 export interface AppServices {
   database: AppDatabase;
@@ -59,7 +62,8 @@ export function createApp(services?: Partial<AppServices>) {
 
   app.use("*", async (c, next) => {
     const started = performance.now();
-    const requestId = c.req.header("x-request-id")?.slice(0, 128) || crypto.randomUUID();
+    const rawReqId = c.req.header("x-request-id") ?? "";
+    const requestId = /^[A-Za-z0-9._:-]{1,128}$/.test(rawReqId) ? rawReqId : crypto.randomUUID();
     c.header("x-request-id", requestId);
     await next();
     if (!c.req.path.startsWith("/public-api/checkout/")) {
@@ -73,6 +77,17 @@ export function createApp(services?: Partial<AppServices>) {
         duration_ms: Math.round((performance.now() - started) * 10) / 10,
       }));
     }
+  });
+
+  app.use("*", async (c, next) => {
+    if (["GET", "HEAD", "OPTIONS"].includes(c.req.method)) return next();
+    const isQrUpload = c.req.path === "/admin-api/settings/qr" || c.req.path === "/admin-api/settings/qr/wechat";
+    const maxSize = isQrUpload ? 6 * 1024 * 1024 : 256 * 1024;
+    const limiter = bodyLimit({
+      maxSize,
+      onError: (ctx) => ctx.json({ error: "PAYLOAD_TOO_LARGE", message: "请求体超出大小限制" }, 413),
+    });
+    return limiter(c, next);
   });
 
   app.get("/healthz", (c) => c.json({ ok: true, version: "1.0.0", bun: Bun.version }));
@@ -115,8 +130,12 @@ export function createApp(services?: Partial<AppServices>) {
 
   app.notFound(async (c) => {
     if (c.req.method !== "GET" && c.req.method !== "HEAD") return c.json({ error: "NOT_FOUND", message: "接口不存在" }, 404);
-    const clientRoot = resolve(process.cwd(), "dist/client");
-    if (!existsSync(clientRoot)) return c.json({ error: "FRONTEND_NOT_BUILT", message: "前端尚未构建，请在开发环境使用 Vite 端口 5173" }, 404);
+    if (!clientRootReady) {
+      if (!existsSync(CLIENT_ROOT)) {
+        return c.json({ error: "FRONTEND_NOT_BUILT", message: "前端尚未构建，请在开发环境使用 Vite 端口 5173" }, 404);
+      }
+      clientRootReady = true;
+    }
     let requestPath = "";
     try {
       requestPath = decodeURIComponent(new URL(c.req.url).pathname);
@@ -124,20 +143,24 @@ export function createApp(services?: Partial<AppServices>) {
       return c.json({ error: "BAD_REQUEST", message: "请求路径格式无效" }, 400);
     }
     const relative = requestPath.replace(/^\/+/, "");
-    const candidate = resolve(clientRoot, relative || "index.html");
-    if (candidate.startsWith(`${clientRoot}${sep}`)) {
+    const candidate = resolve(CLIENT_ROOT, relative || "index.html");
+    const ext = extname(candidate).toLowerCase();
+    if (ext === ".map") {
+      return c.json({ error: "NOT_FOUND", message: "文件不存在" }, 404);
+    }
+    if (candidate.startsWith(`${CLIENT_ROOT}${sep}`)) {
       const asset = Bun.file(candidate);
       if (await asset.exists()) {
         return new Response(asset, {
           headers: {
-            "content-type": ASSET_CONTENT_TYPES[extname(candidate)] ?? "application/octet-stream",
+            "content-type": ASSET_CONTENT_TYPES[ext] ?? "application/octet-stream",
             "cache-control": candidate.endsWith("index.html") ? "no-cache" : "public, max-age=31536000, immutable",
             "x-content-type-options": "nosniff",
           },
         });
       }
     }
-    const index = Bun.file(resolve(clientRoot, "index.html"));
+    const index = Bun.file(resolve(CLIENT_ROOT, "index.html"));
     return new Response(index, {
       headers: {
         "content-type": "text/html; charset=utf-8",
@@ -166,7 +189,10 @@ if (import.meta.main) {
   const server = Bun.serve({
     hostname: runtime.host,
     port: runtime.port,
-    fetch: app.fetch,
+    fetch(req, srv) {
+      attachSocketIp(req, srv.requestIP(req)?.address);
+      return app.fetch(req, srv);
+    },
   });
   console.log(JSON.stringify({ level: "info", event: "server_started", url: server.url.toString(), data_dir: runtime.dataDir }));
 

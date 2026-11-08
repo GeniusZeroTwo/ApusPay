@@ -213,4 +213,83 @@ describe("admin session and CSRF", () => {
     });
     expect(otherMe.status).toBe(401);
   });
+
+  it("auto-authenticates on /setup, binds CSRF to session, hides wxpay_hook_token in GET /settings, and blocks cross-origin logout", async () => {
+    const { createDatabase } = await import("../src/server/db");
+    database = createDatabase(":memory:");
+    const scanner = new PaymentScanner(database, new EmptyProvider());
+    const { app } = createApp({ database, scanner, notifications: new NotificationWorker(database, fetch) });
+
+    // Cross-origin setup is rejected
+    const evilSetup = await app.request("http://localhost/admin-api/setup", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://evil.example" },
+      body: JSON.stringify({ password: "setup-secret-password-123", public_base_url: "http://localhost" }),
+    });
+    expect(evilSetup.status).toBe(403);
+
+    // Valid setup creates session cookies immediately
+    const setupRes = await app.request("http://localhost/admin-api/setup", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "http://localhost" },
+      body: JSON.stringify({ password: "setup-secret-password-123", public_base_url: "http://localhost" }),
+    });
+    expect(setupRes.status).toBe(200);
+    const setCookies = setupRes.headers.get("set-cookie") ?? "";
+    const sessionMatch = setCookies.match(/apuspay_session=([^;]+)/);
+    const csrfMatch = setCookies.match(/apuspay_csrf=([^;]+)/);
+    expect(sessionMatch).toBeTruthy();
+    expect(csrfMatch).toBeTruthy();
+    const validCookie = `apuspay_session=${sessionMatch![1]}; apuspay_csrf=${csrfMatch![1]}`;
+
+    // Immediate GET /admin-api/me succeeds
+    const meRes = await app.request("http://localhost/admin-api/me", {
+      headers: { cookie: validCookie },
+    });
+    expect(meRes.status).toBe(200);
+
+    // Forged CSRF cookie/header pair that does not match session's csrf_hash is rejected
+    const forgedCsrf = await app.request("http://localhost/admin-api/settings", {
+      method: "PUT",
+      headers: {
+        cookie: `apuspay_session=${sessionMatch![1]}; apuspay_csrf=forged-csrf-token`,
+        "x-csrf-token": "forged-csrf-token",
+        origin: "http://localhost",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ v1_enabled: false }),
+    });
+    expect(forgedCsrf.status).toBe(403);
+
+    // GET /admin-api/settings does not leak plaintext wxpay_hook_token
+    const settingsRes = await app.request("http://localhost/admin-api/settings", {
+      headers: { cookie: validCookie },
+    });
+    expect(settingsRes.status).toBe(200);
+    const settingsBody = await settingsRes.json() as Record<string, unknown>;
+    expect(settingsBody.has_wxpay_hook_token).toBe(true);
+    expect(settingsBody.wxpay_hook_token).toBeUndefined();
+
+    // Audited reveal endpoint returns the hook token and records audit log
+    const revealRes = await app.request("http://localhost/admin-api/keys/wxpay/hook-token/reveal", {
+      method: "POST",
+      headers: {
+        cookie: validCookie,
+        "x-csrf-token": csrfMatch![1]!,
+        origin: "http://localhost",
+      },
+    });
+    expect(revealRes.status).toBe(200);
+    const revealBody = await revealRes.json() as { hook_token: string };
+    expect(revealBody.hook_token.length).toBeGreaterThanOrEqual(8);
+    const auditRow = database.query("SELECT * FROM audit_logs WHERE action = 'keys.wxpay_hook_token_reveal'").get();
+    expect(auditRow).not.toBeNull();
+
+    // Cross-origin logout is rejected (403) without destroying session
+    const crossOriginLogout = await app.request("http://localhost/admin-api/logout", {
+      method: "POST",
+      headers: { cookie: validCookie, origin: "https://evil.example" },
+    });
+    expect(crossOriginLogout.status).toBe(403);
+  });
 });

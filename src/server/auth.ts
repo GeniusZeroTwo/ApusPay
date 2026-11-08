@@ -41,17 +41,28 @@ function pruneLoginBuckets(now: number) {
   }
 }
 
-export function clientIp(headers: Headers) {
+const socketIps = new WeakMap<Request, string>();
+const lastSessionPruneAt = new WeakMap<AppDatabase, number>();
+const SESSION_PRUNE_INTERVAL_MS = 60_000;
+const SESSION_TOUCH_INTERVAL_MS = 60_000;
+
+export function attachSocketIp(request: Request, ip: string | undefined) {
+  if (ip) socketIps.set(request, ip);
+}
+
+export function clientIp(headers: Headers, rawRequest?: Request) {
+  const peerIp = (rawRequest ? socketIps.get(rawRequest) : undefined) ?? "";
   if (getRuntimeEnv().trustProxy) {
     const trustCloudflare = process.env.TRUST_CLOUDFLARE === "1" || process.env.TRUST_CLOUDFLARE?.toLowerCase() === "true";
-    const cfIp = trustCloudflare ? headers.get("cf-connecting-ip") : null;
+    const cfIp = trustCloudflare ? headers.get("cf-connecting-ip")?.trim() : null;
     const xff = headers.get("x-forwarded-for");
     const forwardedIp = xff
       ? xff.split(",").map((part) => part.trim()).filter(Boolean).at(-1)
       : null;
-    return (cfIp ?? headers.get("x-real-ip") ?? forwardedIp ?? "").trim().slice(0, 128);
+    // Prefer rightmost X-Forwarded-For over X-Real-IP so attacker-supplied X-Real-IP cannot spoof IP behind XFF proxies
+    return (cfIp || forwardedIp || headers.get("x-real-ip") || peerIp || "").trim().slice(0, 128);
   }
-  return "";
+  return peerIp.trim().slice(0, 128);
 }
 
 export function setupCompleted(database: AppDatabase) {
@@ -120,22 +131,23 @@ export async function verifyPassword(password: string, hash: string) {
   return Bun.password.verify(password, hash, "argon2id");
 }
 
-export function createSession(database: AppDatabase, userId: string, headers: Headers) {
+export function createSession(database: AppDatabase, userId: string, headers: Headers, rawRequest?: Request) {
   const token = randomToken(32);
   const csrf = randomToken(24);
   const now = new Date();
   const expires = new Date(now.getTime() + 24 * 60 * 60_000);
   database.query(`
-    INSERT INTO sessions(id, user_id, token_hash, expires_at, created_at, last_seen_at, ip, user_agent)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO sessions(id, user_id, token_hash, csrf_hash, expires_at, created_at, last_seen_at, ip, user_agent)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     crypto.randomUUID(),
     userId,
     sha256(token),
+    sha256(csrf),
     expires.toISOString(),
     now.toISOString(),
     now.toISOString(),
-    clientIp(headers),
+    clientIp(headers, rawRequest),
     (headers.get("user-agent") ?? "").slice(0, 512),
   );
   return { token, csrf, expires };
@@ -143,8 +155,10 @@ export function createSession(database: AppDatabase, userId: string, headers: He
 
 export function setAuthCookies(c: Parameters<typeof setCookie>[0], session: ReturnType<typeof createSession>) {
   const reqUrl = (c as { req?: { url?: string } }).req?.url ?? "";
-  const forwardedProto = (c as { req?: { header?: (n: string) => string | undefined } }).req?.header?.("x-forwarded-proto") ?? "";
-  const isHttps = reqUrl.startsWith("https://") || forwardedProto === "https";
+  const forwardedProto = getRuntimeEnv().trustProxy
+    ? ((c as { req?: { header?: (n: string) => string | undefined } }).req?.header?.("x-forwarded-proto") ?? "")
+    : "";
+  const isHttps = reqUrl.startsWith("https://") || forwardedProto.split(",")[0]?.trim().toLowerCase() === "https";
   const secure = getRuntimeEnv().nodeEnv === "production" ? isHttps : false;
   setCookie(c, SESSION_COOKIE, session.token, {
     httpOnly: true,
@@ -173,25 +187,37 @@ export function authMiddleware(database: AppDatabase): MiddlewareHandler<{ Varia
   return async (c, next) => {
     const token = getCookie(c, SESSION_COOKIE) ?? getCookie(c, "alimpay_session") ?? "";
     if (!token) throw new AppError(401, "AUTH_REQUIRED", "请先登录");
-    const now = new Date().toISOString();
-    database.query("DELETE FROM sessions WHERE expires_at <= ?").run(now);
+    const nowMs = Date.now();
+    const now = new Date(nowMs).toISOString();
+
+    const lastPrune = lastSessionPruneAt.get(database) ?? 0;
+    if (nowMs - lastPrune >= SESSION_PRUNE_INTERVAL_MS) {
+      lastSessionPruneAt.set(database, nowMs);
+      database.query("DELETE FROM sessions WHERE expires_at <= ?").run(now);
+    }
+
     const row = database.query(`
-      SELECT u.id, u.username, u.created_at, s.token_hash
+      SELECT u.id, u.username, u.created_at, s.token_hash, s.csrf_hash, s.last_seen_at
       FROM sessions s JOIN admin_users u ON u.id = s.user_id
       WHERE s.token_hash = ? AND s.expires_at > ?
-    `).get(sha256(token), now) as (AdminUser & { token_hash: string }) | null;
+    `).get(sha256(token), now) as (AdminUser & { token_hash: string; csrf_hash: string; last_seen_at: string }) | null;
     if (!row) throw new AppError(401, "SESSION_EXPIRED", "登录已过期，请重新登录");
 
     if (!["GET", "HEAD", "OPTIONS"].includes(c.req.method)) {
       assertOriginAllowed(c.req.url, c.req.header("origin") || c.req.header("referer"), database);
       const csrfHeader = c.req.header("x-csrf-token") ?? "";
       const csrfCookie = getCookie(c, CSRF_COOKIE) ?? getCookie(c, "alimpay_csrf") ?? "";
-      if (!csrfHeader || !csrfCookie || !secureEqual(csrfHeader, csrfCookie)) {
+      const cookieMatches = Boolean(csrfHeader && csrfCookie && secureEqual(csrfHeader, csrfCookie));
+      const sessionBoundMatches = !row.csrf_hash || secureEqual(sha256(csrfHeader), row.csrf_hash);
+      if (!cookieMatches || !sessionBoundMatches) {
         throw new AppError(403, "CSRF_REJECTED", "CSRF 校验失败，请刷新页面后重试");
       }
     }
 
-    database.query("UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?").run(now, row.token_hash);
+    const lastSeenMs = Date.parse(row.last_seen_at);
+    if (!Number.isFinite(lastSeenMs) || nowMs - lastSeenMs >= SESSION_TOUCH_INTERVAL_MS) {
+      database.query("UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?").run(now, row.token_hash);
+    }
     c.set("admin", { id: row.id, username: row.username, created_at: row.created_at });
     await next();
   };

@@ -4,9 +4,11 @@ import {
   decryptSecret,
   encryptSecret,
   generateRsaKeyPair,
+  generateRsaKeyPairAsync,
   isPrivateAddress,
   md5Sign,
   parseMoneyToCents,
+  resolvePublicDestination,
   rsaSign,
   rsaVerify,
   validateCallbackUrl,
@@ -69,17 +71,47 @@ describe("secret and input security", () => {
     expect(() => parseMoneyToCents("0")).toThrow();
   });
 
-  it("blocks common SSRF destinations", () => {
-    for (const ip of ["127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.1.1", "::1", "fc00::1", "::ffff:7f00:1", "2001:db8::1"]) {
+  it("blocks common SSRF destinations including IPv6 transition ranges", async () => {
+    for (const ip of [
+      "127.0.0.1",
+      "10.1.2.3",
+      "172.16.0.1",
+      "192.168.1.1",
+      "169.254.1.1",
+      "::1",
+      "fc00::1",
+      "::ffff:7f00:1",
+      "::127.0.0.1",
+      "::10.0.0.1",
+      "64:ff9b::127.0.0.1",
+      "64:ff9b::10.0.0.1",
+      "64:ff9b:1::1",
+      "2002:7f00:0001::",
+      "2002:c0a8:0101::",
+      "2001:0000:4136:e378:8000:63bf:3fff:fdd2",
+      "2001:db8::1",
+    ]) {
       expect(isPrivateAddress(ip)).toBe(true);
     }
     expect(isPrivateAddress("8.8.8.8")).toBe(false);
+    expect(isPrivateAddress("64:ff9b::8.8.8.8")).toBe(false);
+    expect(isPrivateAddress("2002:0808:0808::")).toBe(false);
     expect(() => validateCallbackUrl("http://localhost/callback", false)).toThrow();
+    expect(() => validateCallbackUrl("http://[::127.0.0.1]/callback", false)).toThrow();
+    expect(() => validateCallbackUrl("http://[64:ff9b::169.254.169.254]/callback", false)).toThrow();
     expect(() => validateCallbackUrl("file:///etc/passwd", false)).toThrow();
     expect(() => validateCallbackUrl("http://example.com:22/callback", false)).toThrow();
     expect(() => validateCallbackUrl("http://example.com:6379/callback", false)).toThrow();
     expect(() => validateCallbackUrl("http://example.com:25/callback", false)).toThrow();
     expect(validateCallbackUrl("http://example.com:8080/callback", false).port).toBe("8080");
     expect(validateCallbackUrl("https://example.com/callback", false).hostname).toBe("example.com");
+
+    const pinned = await resolvePublicDestination(new URL("https://8.8.8.8/notify"), false);
+    expect(pinned).toEqual([{ address: "8.8.8.8", family: 4 }]);
+    expect(resolvePublicDestination(new URL("https://127.0.0.1/notify"), false)).rejects.toThrow();
+
+    const asyncPair = await generateRsaKeyPairAsync();
+    const sig = rsaSign({ a: "1" }, asyncPair.privateKey);
+    expect(rsaVerify({ a: "1", sign: sig }, asyncPair.publicKey)).toBe(true);
   });
 });

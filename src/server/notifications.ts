@@ -1,10 +1,129 @@
+import type { LookupAddress } from "node:dns";
+import http from "node:http";
+import https from "node:https";
+import { isIP } from "node:net";
 import type { ApiVersion, OrderRecord } from "../shared/contracts";
 import { getSecret } from "./config";
-import { getSetting, type AppDatabase } from "./db";
+import type { AppDatabase } from "./db";
 import { getRuntimeEnv } from "./env";
 import { AppError } from "./errors";
 import { buildReturnParameters, getOrderById } from "./orders";
-import { assertPublicDestination, md5Sign, rsaSign, validateCallbackUrl } from "./security";
+import { md5Sign, resolvePublicDestination, rsaSign, validateCallbackUrl } from "./security";
+
+const MAX_CALLBACK_RESPONSE_BYTES = 4_096;
+const CALLBACK_TIMEOUT_MS = 10_000;
+const activeWorkers = new WeakMap<AppDatabase, NotificationWorker>();
+
+export function notifyNotificationWorker(database: AppDatabase) {
+  const worker = activeWorkers.get(database);
+  if (worker?.isRunning) {
+    queueMicrotask(() => void worker.tick());
+  }
+}
+
+async function readBoundedText(response: Response, maxBytes: number): Promise<string> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done || !value) break;
+      const slice = total + value.byteLength > maxBytes ? value.subarray(0, maxBytes - total) : value;
+      chunks.push(slice);
+      total += slice.byteLength;
+      if (total >= maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        break;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks, total).toString("utf8");
+}
+
+function pinnedHttpGet(
+  targetUrl: string,
+  pinnedAddresses: LookupAddress[],
+  timeoutMs: number,
+  maxBytes: number,
+): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(targetUrl);
+    const isHttps = url.protocol === "https:";
+    const normalizedHost = url.hostname.replace(/^\[|\]$/g, "");
+    const requestFn = isHttps ? https.request : http.request;
+    let settled = false;
+
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
+
+    const req = requestFn(
+      url,
+      {
+        method: "GET",
+        agent: false,
+        headers: {
+          "user-agent": "ApusPay-Bun/1.0 notification",
+          accept: "text/plain, */*;q=0.1",
+          connection: "close",
+        },
+        ...(isHttps && isIP(normalizedHost) === 0 ? { servername: normalizedHost } : {}),
+        lookup: (_hostname, options, callback) => {
+          const opts = typeof options === "object" && options !== null ? options : {};
+          if ((opts as { all?: boolean }).all) {
+            (callback as (err: NodeJS.ErrnoException | null, addresses: LookupAddress[]) => void)(null, pinnedAddresses);
+          } else {
+            const first = pinnedAddresses[0]!;
+            (callback as (err: NodeJS.ErrnoException | null, address: string, family: number) => void)(null, first.address, first.family);
+          }
+        },
+      },
+      (res) => {
+        const status = res.statusCode ?? 0;
+        const chunks: Buffer[] = [];
+        let total = 0;
+        res.on("data", (chunk: Buffer | string) => {
+          const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          if (total < maxBytes) {
+            const take = Math.min(buf.length, maxBytes - total);
+            chunks.push(buf.subarray(0, take));
+            total += take;
+          }
+          if (total >= maxBytes) {
+            res.destroy();
+          }
+        });
+        res.on("end", () => {
+          finish(() => resolve({ status, body: Buffer.concat(chunks, total).toString("utf8") }));
+        });
+        res.on("close", () => {
+          finish(() => resolve({ status, body: Buffer.concat(chunks, total).toString("utf8") }));
+        });
+        res.on("error", (err) => {
+          if (total >= maxBytes) {
+            finish(() => resolve({ status, body: Buffer.concat(chunks, total).toString("utf8") }));
+          } else {
+            finish(() => reject(err));
+          }
+        });
+      },
+    );
+
+    const timer = setTimeout(() => {
+      req.destroy(new Error("通知请求超时"));
+    }, timeoutMs);
+
+    req.on("error", (err) => finish(() => reject(err)));
+    req.end();
+  });
+}
 
 interface NotificationJob {
   id: string;
@@ -66,26 +185,34 @@ export function queueManualNotification(database: AppDatabase, orderId: string) 
     INSERT INTO notification_jobs(id, order_id, status, attempts, max_attempts, next_attempt_at, manual, created_at, updated_at)
     VALUES (?, ?, 'pending', 0, 1, ?, 1, ?, ?)
   `).run(id, orderId, now, now, now);
+  notifyNotificationWorker(database);
   return id;
 }
 
 export class NotificationWorker {
   private timer: ReturnType<typeof setInterval> | null = null;
   private working = false;
+  private pendingRetick = false;
 
   constructor(
     private readonly database: AppDatabase,
     private readonly fetcher: typeof fetch = fetch,
   ) {
+    activeWorkers.set(database, this);
     const now = new Date().toISOString();
     this.database.query(`
       UPDATE notification_jobs SET status = 'pending', next_attempt_at = ?, updated_at = ? WHERE status = 'processing'
     `).run(now, now);
   }
 
+  get isRunning() {
+    return this.timer !== null;
+  }
+
   start() {
     if (this.timer) return;
-    this.timer = setInterval(() => void this.tick(), 500);
+    activeWorkers.set(this.database, this);
+    this.timer = setInterval(() => void this.tick(), 1_500);
     void this.tick();
   }
 
@@ -95,44 +222,56 @@ export class NotificationWorker {
   }
 
   async tick() {
-    if (this.working) return;
+    if (this.working) {
+      this.pendingRetick = true;
+      return;
+    }
     this.working = true;
     try {
-      for (let count = 0; count < 10; count += 1) {
-        const job = this.claimNext();
-        if (!job) break;
-        await this.deliver(job);
-      }
+      do {
+        this.pendingRetick = false;
+        for (let wave = 0; wave < 4; wave += 1) {
+          const batch = this.claimBatch(4);
+          if (batch.length === 0) break;
+          await Promise.all(batch.map((job) => this.deliver(job)));
+        }
+      } while (this.pendingRetick);
     } finally {
       this.working = false;
     }
   }
 
-  private claimNext() {
+  private claimBatch(limit: number): NotificationJob[] {
     const now = new Date().toISOString();
     const hasPending = this.database.query(`
       SELECT 1 FROM notification_jobs
       WHERE status = 'pending' AND next_attempt_at <= ?
       LIMIT 1
     `).get(now);
-    if (!hasPending) return null;
+    if (!hasPending) return [];
 
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const job = this.database.query(`
+      const candidates = this.database.query(`
         SELECT * FROM notification_jobs
         WHERE status = 'pending' AND next_attempt_at <= ?
-        ORDER BY next_attempt_at ASC LIMIT 1
-      `).get(now) as NotificationJob | null;
-      if (!job) {
+        ORDER BY next_attempt_at ASC LIMIT ?
+      `).all(now, limit) as NotificationJob[];
+      if (candidates.length === 0) {
         this.database.exec("COMMIT");
-        return null;
+        return [];
       }
-      const changed = this.database.query(`
+      const updateStmt = this.database.query(`
         UPDATE notification_jobs SET status = 'processing', updated_at = ? WHERE id = ? AND status = 'pending'
-      `).run(now, job.id).changes;
+      `);
+      const claimed: NotificationJob[] = [];
+      for (const job of candidates) {
+        if (updateStmt.run(now, job.id).changes > 0) {
+          claimed.push(job);
+        }
+      }
       this.database.exec("COMMIT");
-      return changed ? job : null;
+      return claimed;
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
@@ -153,22 +292,30 @@ export class NotificationWorker {
     let acknowledged = false;
     try {
       if (!order) throw new Error("关联订单不存在");
-      const target = validateCallbackUrl(order.notify_url, getRuntimeEnv().allowPrivateCallbacks, getRuntimeEnv().allowedCallbackHosts);
-      await assertPublicDestination(target, getRuntimeEnv().allowPrivateCallbacks, getRuntimeEnv().allowedCallbackHosts);
+      const runtime = getRuntimeEnv();
+      const target = validateCallbackUrl(order.notify_url, runtime.allowPrivateCallbacks, runtime.allowedCallbackHosts);
+      const pinnedAddresses = await resolvePublicDestination(target, runtime.allowPrivateCallbacks, runtime.allowedCallbackHosts);
       const signedUrl = buildSignedCallbackUrl(this.database, order, target.toString());
-      const response = await this.fetcher(signedUrl, {
-        method: "GET",
-        redirect: "manual",
-        headers: {
-          "user-agent": "ApusPay-Bun/1.0 notification",
-          accept: "text/plain, */*;q=0.1",
-        },
-        signal: AbortSignal.timeout(10_000),
-      });
-      responseStatus = response.status;
-      responseBody = (await response.text()).slice(0, 500);
-      acknowledged = response.status >= 200 && response.status < 300 && responseBody.trim() === "success";
-      if (!acknowledged) errorMessage = `商户未确认通知（HTTP ${response.status}）`;
+
+      if (this.fetcher === fetch && pinnedAddresses && pinnedAddresses.length > 0) {
+        const pinnedRes = await pinnedHttpGet(signedUrl, pinnedAddresses, CALLBACK_TIMEOUT_MS, MAX_CALLBACK_RESPONSE_BYTES);
+        responseStatus = pinnedRes.status;
+        responseBody = pinnedRes.body.slice(0, 500);
+      } else {
+        const response = await this.fetcher(signedUrl, {
+          method: "GET",
+          redirect: "manual",
+          headers: {
+            "user-agent": "ApusPay-Bun/1.0 notification",
+            accept: "text/plain, */*;q=0.1",
+          },
+          signal: AbortSignal.timeout(CALLBACK_TIMEOUT_MS),
+        });
+        responseStatus = response.status;
+        responseBody = (await readBoundedText(response, MAX_CALLBACK_RESPONSE_BYTES)).slice(0, 500);
+      }
+      acknowledged = responseStatus >= 200 && responseStatus < 300 && responseBody.trim() === "success";
+      if (!acknowledged) errorMessage = `商户未确认通知（HTTP ${responseStatus}）`;
     } catch (error) {
       errorMessage = error instanceof Error ? error.message : String(error);
     }
@@ -197,10 +344,29 @@ export function notificationHistory(database: AppDatabase, orderId: string) {
   const jobs = database.query(`
     SELECT * FROM notification_jobs WHERE order_id = ? ORDER BY created_at DESC
   `).all(orderId) as Array<Record<string, unknown>>;
+  if (jobs.length === 0) return [];
+
+  const allAttempts = database.query(`
+    SELECT a.*
+    FROM notification_attempts a
+    JOIN notification_jobs j ON j.id = a.job_id
+    WHERE j.order_id = ?
+    ORDER BY a.attempt_number ASC
+  `).all(orderId) as Array<Record<string, unknown>>;
+
+  const attemptsByJob = new Map<string, Array<Record<string, unknown>>>();
+  for (const attempt of allAttempts) {
+    const jobId = String(attempt.job_id);
+    let list = attemptsByJob.get(jobId);
+    if (!list) {
+      list = [];
+      attemptsByJob.set(jobId, list);
+    }
+    list.push(attempt);
+  }
+
   return jobs.map((job) => ({
     ...job,
-    attempts_detail: database.query(`
-      SELECT * FROM notification_attempts WHERE job_id = ? ORDER BY attempt_number ASC
-    `).all(String(job.id)),
+    attempts_detail: attemptsByJob.get(String(job.id)) ?? [],
   }));
 }

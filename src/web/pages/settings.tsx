@@ -10,7 +10,7 @@ import {
   Upload,
   Zap,
 } from "lucide-react";
-import { type FormEvent, useEffect, useState } from "react";
+import { type FormEvent, useState } from "react";
 import useSWR from "swr";
 import { toast } from "sonner";
 import {
@@ -74,17 +74,29 @@ function SettingsForm({ initial, refresh }: { initial: SettingsData; refresh: ()
   const [wxpayPublicKey, setWxpayPublicKey] = useState(initial.wxpay_public_key ?? "");
   const [wxpayPrivateKey, setWxpayPrivateKey] = useState("");
   const [wxpayApiV3Key, setWxpayApiV3Key] = useState("");
-  const [wxpayHookToken, setWxpayHookToken] = useState(initial.wxpay_hook_token ?? "");
-
-  useEffect(() => {
-    if (initial.wxpay_hook_token !== undefined) {
-      setWxpayHookToken(initial.wxpay_hook_token);
-    }
-  }, [initial.wxpay_hook_token]);
+  const [wxpayHookToken, setWxpayHookToken] = useState("");
+  const [revealingHookToken, setRevealingHookToken] = useState(false);
 
   const [saving, setSaving] = useState(false);
   const [testingAlipay, setTestingAlipay] = useState(false);
   const [testingWechat, setTestingWechat] = useState(false);
+
+  async function revealHookToken() {
+    setRevealingHookToken(true);
+    try {
+      const res = await apiFetch<{ hook_token: string }>("/admin-api/keys/wxpay/hook-token/reveal", { method: "POST" });
+      if (res.hook_token) {
+        setWxpayHookToken(res.hook_token);
+        toast.success("已加载当前 Hook Token（审计日志已记录）");
+      } else {
+        toast.info("当前尚未配置 Hook Token");
+      }
+    } catch (err: unknown) {
+      toast.error(err instanceof Error ? err.message : "读取 Hook Token 失败");
+    } finally {
+      setRevealingHookToken(false);
+    }
+  }
 
   async function save(event: FormEvent) {
     event.preventDefault();
@@ -113,9 +125,12 @@ function SettingsForm({ initial, refresh }: { initial: SettingsData; refresh: ()
           wxpay_mch_id: wxpayMchId,
           wxpay_serial_no: wxpaySerialNo,
           wxpay_public_key: wxpayPublicKey,
-          wxpay_hook_token: wxpayHookToken,
+          ...(wxpayHookToken.trim() || !initial.has_wxpay_hook_token
+            ? { wxpay_hook_token: wxpayHookToken.trim() }
+            : {}),
         }),
       });
+      setWxpayHookToken("");
 
       // Save WeChat secrets if entered
       if (wxpayPrivateKey || wxpayApiV3Key) {
@@ -625,18 +640,35 @@ function SettingsForm({ initial, refresh }: { initial: SettingsData; refresh: ()
 
                   <div className="space-y-2">
                     <div className="flex items-center justify-between">
-                      <Label htmlFor="wx-hook-token">Hook 鉴权 Token (必填，至少 8 位)</Label>
-                      {initial.has_wxpay_hook_token ? (
-                        <span className="text-xs text-emerald-600 font-medium">● Token 已受保护</span>
-                      ) : (
-                        <span className="text-xs text-destructive">未配置（保存时将自动生成）</span>
-                      )}
+                      <Label htmlFor="wx-hook-token">Hook 鉴权 Token (至少 8 位)</Label>
+                      <div className="flex items-center gap-2">
+                        {initial.has_wxpay_hook_token ? (
+                          <>
+                            <span className="text-xs text-emerald-600 font-medium">● Token 已加密保护（留空保持不变）</span>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              className="h-6 px-2 text-xs"
+                              onClick={revealHookToken}
+                              disabled={revealingHookToken}
+                            >
+                              <KeyRound className="mr-1 size-3" />
+                              {revealingHookToken ? "读取中..." : "查看当前 Token"}
+                            </Button>
+                          </>
+                        ) : (
+                          <span className="text-xs text-destructive">未配置（保存时将自动生成）</span>
+                        )}
+                      </div>
                     </div>
                     <Input
                       id="wx-hook-token"
+                      type="password"
+                      autoComplete="new-password"
                       value={wxpayHookToken}
                       onChange={(e) => setWxpayHookToken(e.target.value)}
-                      placeholder="PC Hook 客户端请求必须通过 X-Hook-Token 请求头携带此密钥"
+                      placeholder={initial.has_wxpay_hook_token ? "已配置，留空保持不变；输入新值可轮换密钥" : "PC Hook 客户端请求必须通过 X-Hook-Token 请求头携带此密钥"}
                     />
                   </div>
 

@@ -1,19 +1,20 @@
-import type { ReactNode } from "react";
+import { Suspense, lazy, type ReactNode } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
 import useSWR from "swr";
 import { ApiClientError, swrFetcher } from "@/web/api";
-import { AppShell } from "@/web/components/app-shell";
 import { Loading } from "@/web/components/ui/loading";
-import { CheckoutPage } from "@/web/pages/checkout";
-import { DashboardPage } from "@/web/pages/dashboard";
-import { DocsPage } from "@/web/pages/docs";
-import { KeyCenterPage } from "@/web/pages/keys";
-import { LoginPage } from "@/web/pages/login";
-import { OrderDetailPage } from "@/web/pages/order-detail";
-import { OrdersPage } from "@/web/pages/orders";
-import { SettingsPage } from "@/web/pages/settings";
-import { SetupPage } from "@/web/pages/setup";
-import { SystemPage } from "@/web/pages/system";
+
+const AppShell = lazy(() => import("@/web/components/app-shell").then((m) => ({ default: m.AppShell })));
+const CheckoutPage = lazy(() => import("@/web/pages/checkout").then((m) => ({ default: m.CheckoutPage })));
+const DashboardPage = lazy(() => import("@/web/pages/dashboard").then((m) => ({ default: m.DashboardPage })));
+const DocsPage = lazy(() => import("@/web/pages/docs").then((m) => ({ default: m.DocsPage })));
+const KeyCenterPage = lazy(() => import("@/web/pages/keys").then((m) => ({ default: m.KeyCenterPage })));
+const LoginPage = lazy(() => import("@/web/pages/login").then((m) => ({ default: m.LoginPage })));
+const OrderDetailPage = lazy(() => import("@/web/pages/order-detail").then((m) => ({ default: m.OrderDetailPage })));
+const OrdersPage = lazy(() => import("@/web/pages/orders").then((m) => ({ default: m.OrdersPage })));
+const SettingsPage = lazy(() => import("@/web/pages/settings").then((m) => ({ default: m.SettingsPage })));
+const SetupPage = lazy(() => import("@/web/pages/setup").then((m) => ({ default: m.SetupPage })));
+const SystemPage = lazy(() => import("@/web/pages/system").then((m) => ({ default: m.SystemPage })));
 
 function RequireAdmin({ children }: { children: ReactNode }) {
   const { data, error, isLoading, isValidating } = useSWR<{ user: { username: string } }>("/admin-api/me", swrFetcher, { shouldRetryOnError: false });
@@ -31,21 +32,23 @@ function Home() {
 
 export function App() {
   return (
-    <Routes>
-      <Route path="/" element={<Home />} />
-      <Route path="/setup" element={<SetupPage />} />
-      <Route path="/login" element={<LoginPage />} />
-      <Route path="/checkout/:token" element={<CheckoutPage />} />
-      <Route element={<RequireAdmin><AppShell /></RequireAdmin>}>
-        <Route path="/dashboard" element={<DashboardPage />} />
-        <Route path="/orders" element={<OrdersPage />} />
-        <Route path="/orders/:id" element={<OrderDetailPage />} />
-        <Route path="/settings" element={<SettingsPage />} />
-        <Route path="/keys" element={<KeyCenterPage />} />
-        <Route path="/docs" element={<DocsPage />} />
-        <Route path="/system" element={<SystemPage />} />
-      </Route>
-      <Route path="*" element={<Navigate to="/" replace />} />
-    </Routes>
+    <Suspense fallback={<Loading />}>
+      <Routes>
+        <Route path="/" element={<Home />} />
+        <Route path="/setup" element={<SetupPage />} />
+        <Route path="/login" element={<LoginPage />} />
+        <Route path="/checkout/:token" element={<CheckoutPage />} />
+        <Route element={<RequireAdmin><AppShell /></RequireAdmin>}>
+          <Route path="/dashboard" element={<DashboardPage />} />
+          <Route path="/orders" element={<OrdersPage />} />
+          <Route path="/orders/:id" element={<OrderDetailPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
+          <Route path="/keys" element={<KeyCenterPage />} />
+          <Route path="/docs" element={<DocsPage />} />
+          <Route path="/system" element={<SystemPage />} />
+        </Route>
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </Suspense>
   );
 }

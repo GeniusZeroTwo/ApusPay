@@ -242,4 +242,64 @@ describe("PC WeChat Hook contract", () => {
     });
     expect(postUnconfigured.status).toBe(503);
   });
+
+  it("isolates non-hook orders from PC Hook callbacks, enforces WeChat webhook signature, and caps body size", async () => {
+    const configured = configuredDatabase("transfer");
+    database = configured.database;
+    const { setSecret } = await import("../src/server/config");
+    setSecret(database, "wxpay_hook_token", "test-secret-token");
+
+    const scanner = new PaymentScanner(database, new EmptyProvider());
+    const { app } = createApp({ database, scanner, notifications: new NotificationWorker(database, fetch) });
+
+    // 1. Create an Alipay transfer order (not business_qr)
+    const { createOrder, getOrderById } = await import("../src/server/orders");
+    const { order: transferOrder } = await createOrder(database, {
+      pid: "1000000001",
+      apiVersion: "v1",
+      type: "alipay",
+      outTradeNo: "TRANSFER-ONLY-1",
+      name: "Transfer item",
+      money: "8.00",
+      notifyUrl: "https://8.8.8.8/notify",
+      returnUrl: "https://8.8.8.8/return",
+    });
+    expect(transferOrder.collection_mode).toBe("transfer");
+
+    // Hook with type=alipay must NOT match a transfer-mode order
+    const hookRes = await app.request("http://localhost/api/hook/receive?token=test-secret-token", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type: "alipay", money: "8.00" }),
+    });
+    expect(hookRes.status).toBe(200);
+    const hookBody = await hookRes.json() as { code: number };
+    expect(hookBody.code).toBe(0);
+    expect(getOrderById(database, transferOrder.id)?.status).toBe("pending");
+
+    // 2. WeChat APIv3 notify fails closed when wxpay_public_key is unset (503) or signature missing (401)
+    const notifyNoKey = await app.request("http://localhost/api/pay/wechat/notify", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(notifyNoKey.status).toBe(503);
+
+    setSetting(database, "wxpay_public_key", configured.platform.publicKey);
+    const notifyNoHeaders = await app.request("http://localhost/api/pay/wechat/notify", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(notifyNoHeaders.status).toBe(401);
+
+    // 3. Oversized request body (>256 KB) is rejected with 413
+    const hugeBody = JSON.stringify({ type: "wechat", money: "1.00", pad: "x".repeat(300 * 1024) });
+    const tooLarge = await app.request("http://localhost/api/hook/receive?token=test-secret-token", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: hugeBody,
+    });
+    expect(tooLarge.status).toBe(413);
+  });
 });

@@ -15,6 +15,7 @@ import { getRuntimeEnv } from "./env";
 import { AppError, assert } from "./errors";
 import { centsToMoney, parseMoneyToCents, randomDigits, randomToken, validateCallbackUrl } from "./security";
 import { OfficialAlipayProvider } from "./alipay";
+import { notifyNotificationWorker } from "./notifications";
 import { WeChatPayService } from "./wechat";
 
 export interface CreateOrderInput {
@@ -184,11 +185,15 @@ export async function createOrder(
     // Allocate floating surcharge only for matching modes (bill & hook)
     if (collectionMode === "business_qr" || collectionMode === "wxpay_hook") {
       const maxOffset = Math.max(0, Math.min(99, getSetting(database, "surcharge_max_cents", 99)));
+      const minCents = input.requestedAmountCents;
+      const maxCents = minCents + maxOffset;
+      const occupiedRows = database.query(
+        "SELECT amount_cents FROM amount_reservations WHERE amount_cents BETWEEN ? AND ?",
+      ).all(minCents, maxCents) as Array<{ amount_cents: number }>;
+      const occupiedSet = new Set(occupiedRows.map((row) => row.amount_cents));
       let allocated = false;
-      for (let offset = 0; offset <= maxOffset; offset += 1) {
-        const candidate = input.requestedAmountCents + offset;
-        const occupied = database.query("SELECT 1 FROM amount_reservations WHERE amount_cents = ? LIMIT 1").get(candidate);
-        if (!occupied) {
+      for (let candidate = minCents; candidate <= maxCents; candidate += 1) {
+        if (!occupiedSet.has(candidate)) {
           payableAmountCents = candidate;
           allocated = true;
           break;
@@ -297,14 +302,9 @@ export async function createOrder(
 }
 
 export function expireOrders(database: AppDatabase, now = new Date().toISOString()) {
-  const expiredOrders = database.query(`
-    SELECT id FROM orders WHERE status = 'pending' AND expires_at <= ?
-  `).all(now) as Array<{ id: string }>;
-  if (expiredOrders.length > 0) {
-    database.query(`
-      UPDATE orders SET status = 'expired' WHERE status = 'pending' AND expires_at <= ?
-    `).run(now);
-  }
+  database.query(`
+    UPDATE orders SET status = 'expired' WHERE status = 'pending' AND expires_at <= ?
+  `).run(now);
 }
 
 export function getOrderById(database: AppDatabase, id: string): OrderRecord | null {
@@ -424,12 +424,20 @@ export function markOrderPaidDirectly(
     }
 
     database.exec("COMMIT");
+    notifyNotificationWorker(database);
     return true;
   } catch (error) {
     database.exec("ROLLBACK");
     throw error;
   }
 }
+
+const BILL_MATCHABLE_MODES = new Set<CollectionMode>([
+  "business_qr",
+  "transfer",
+  "alipay_bill",
+  "alipay_transfer",
+]);
 
 export function recordAndMatchPayment(
   database: AppDatabase,
@@ -448,6 +456,7 @@ export function recordAndMatchPayment(
     let matchedOrder: OrderRecord | undefined;
     if (event.direction === "收入") {
       matchedOrder = candidates.find((order) => {
+        if (order.type !== "alipay" || !BILL_MATCHABLE_MODES.has(order.collection_mode)) return false;
         const occurred = Date.parse(event.occurredAt);
         const withinWindow = occurred >= Date.parse(order.created_at) - 60_000 && occurred <= Date.parse(order.monitor_until);
         if (!withinWindow || order.payable_amount_cents !== event.amountCents) return false;
@@ -484,6 +493,7 @@ export function recordAndMatchPayment(
           UPDATE orders SET status = ?, paid_at = ?, alipay_account_log_id = ?, alipay_order_no = ?, buyer = ?
           WHERE id = ? AND status IN ('pending', 'expired')
         `).run(status, event.occurredAt, event.accountLogId, event.alipayOrderNo || null, event.otherAccount ?? null, current.id);
+        database.query("DELETE FROM amount_reservations WHERE order_id = ?").run(current.id);
         database.query(`
           INSERT INTO notification_jobs(id, order_id, status, attempts, max_attempts, next_attempt_at, manual, created_at, updated_at)
           VALUES (?, ?, 'pending', 0, 10, ?, 0, ?, ?)
@@ -494,6 +504,9 @@ export function recordAndMatchPayment(
     }
 
     database.exec("COMMIT");
+    if (matchedOrder) {
+      notifyNotificationWorker(database);
+    }
     return { matched: Boolean(matchedOrder), duplicate: false, orderId: matchedOrder?.id ?? null };
   } catch (error) {
     database.exec("ROLLBACK");
@@ -505,18 +518,20 @@ export function externalStatus(status: OrderStatus) {
   return status === "paid" || status === "late_paid" ? 1 : 0;
 }
 
+const API_DATE_FORMATTER = new Intl.DateTimeFormat("sv-SE", {
+  timeZone: "Asia/Taipei",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false,
+});
+
 export function formatApiDate(value: string | null) {
   if (!value) return "";
-  const parts = new Intl.DateTimeFormat("sv-SE", {
-    timeZone: "Asia/Taipei",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).formatToParts(new Date(value));
+  const parts = API_DATE_FORMATTER.formatToParts(new Date(value));
   const get = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value ?? "";
   return `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")}:${get("second")}`;
 }

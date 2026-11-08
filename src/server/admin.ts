@@ -34,7 +34,7 @@ import { AppError, assert } from "./errors";
 import { notificationHistory, queueManualNotification } from "./notifications";
 import { getOrderById, listOrders, markOrderPaidDirectly } from "./orders";
 import {
-  generateRsaKeyPair,
+  generateRsaKeyPairAsync,
   randomAlphaNumeric,
   randomMerchantPid,
   sha256,
@@ -56,35 +56,60 @@ const loginSchema = z.object({
 });
 
 function validatePublicBaseUrl(value: string) {
-  const url = new URL(value);
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new AppError(400, "INVALID_PUBLIC_URL", "公开地址必须是有效的 HTTP/HTTPS URL");
+  }
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) {
     throw new AppError(400, "INVALID_PUBLIC_URL", "公开地址必须是无账号信息的 HTTP/HTTPS URL");
   }
   return url.toString().replace(/\/$/, "");
 }
 
+function validateQrImageUrl(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (/^\/uploads\/[A-Za-z0-9._-]+$/.test(trimmed)) return trimmed;
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    throw new AppError(400, "INVALID_QR_URL", "收款码地址必须是有效的 HTTP/HTTPS URL 或站内上传路径");
+  }
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) {
+    throw new AppError(400, "INVALID_QR_URL", "收款码地址仅允许无账号信息的 HTTP/HTTPS URL");
+  }
+  return url.toString();
+}
+
+const TAIPEI_MIDNIGHT_FORMATTER = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Asia/Taipei",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+
+const SHANGHAI_TIME_FORMATTER = new Intl.DateTimeFormat("sv-SE", {
+  timeZone: "Asia/Shanghai",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false,
+});
+
 function taipeiMidnight(daysAgo = 0) {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Taipei",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(new Date(Date.now() - daysAgo * 86_400_000));
+  const parts = TAIPEI_MIDNIGHT_FORMATTER.formatToParts(new Date(Date.now() - daysAgo * 86_400_000));
   const part = (type: Intl.DateTimeFormatPartTypes) => parts.find((item) => item.type === type)?.value ?? "";
   return new Date(`${part("year")}-${part("month")}-${part("day")}T00:00:00+08:00`).toISOString();
 }
 
 function shanghaiTime(value: Date) {
-  return new Intl.DateTimeFormat("sv-SE", {
-    timeZone: "Asia/Shanghai",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).format(value);
+  return SHANGHAI_TIME_FORMATTER.format(value);
 }
 
 function imageType(buffer: Uint8Array) {
@@ -101,38 +126,48 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
   app.get("/setup/status", (c) => c.json({ setup_completed: setupCompleted(database) }));
 
   app.post("/setup", async (c) => {
+    assertOriginAllowed(c.req.url, c.req.header("origin") || c.req.header("referer"), database);
+    if (setupCompleted(database)) throw new AppError(400, "ALREADY_SETUP", "初始设置已完成");
+    const json = await c.req.json().catch(() => ({}));
+    const parsed = setupSchema.safeParse(json);
+    if (!parsed.success) throw new AppError(400, "VALIDATION_FAILED", parsed.error.issues[0]?.message ?? "参数错误");
+    const url = validatePublicBaseUrl(parsed.data.public_base_url);
+
+    // Run CPU-intensive Argon2id & 3x RSA-2048 keygens outside the SQLite write lock
+    const [hash, v2Platform, v2Merchant, alipayKeys] = await Promise.all([
+      createPasswordHash(parsed.data.password),
+      generateRsaKeyPairAsync(),
+      generateRsaKeyPairAsync(),
+      generateRsaKeyPairAsync(),
+    ]);
+
     database.exec("BEGIN IMMEDIATE");
     try {
       if (setupCompleted(database)) throw new AppError(400, "ALREADY_SETUP", "初始设置已完成");
-      const json = await c.req.json().catch(() => ({}));
-      const parsed = setupSchema.safeParse(json);
-      if (!parsed.success) throw new AppError(400, "VALIDATION_FAILED", parsed.error.issues[0]?.message ?? "参数错误");
-      const url = validatePublicBaseUrl(parsed.data.public_base_url);
-      const hash = await createPasswordHash(parsed.data.password);
       const now = new Date().toISOString();
+      const userId = crypto.randomUUID();
       database.query(`
         INSERT INTO admin_users(id, username, password_hash, created_at, updated_at)
         VALUES (?, 'admin', ?, ?, ?)
-      `).run(crypto.randomUUID(), hash, now, now);
+      `).run(userId, hash, now, now);
       setSetting(database, "setup_completed", true);
       setSetting(database, "public_base_url", url);
       setSetting(database, "merchant_pid", randomMerchantPid());
       setSecret(database, "v1_key", randomAlphaNumeric(32));
-      const v2Platform = generateRsaKeyPair();
-      const v2Merchant = generateRsaKeyPair();
       setSecret(database, "v2_platform_private_key", v2Platform.privateKey);
       setSetting(database, "v2_platform_public_key", v2Platform.publicKey);
       setSetting(database, "v2_merchant_public_key", v2Merchant.publicKey);
 
-      const alipayKeys = generateRsaKeyPair();
       setSecret(database, "alipay_private_key", alipayKeys.privateKey);
       setSetting(database, "alipay_app_public_key", alipayKeys.publicKey);
 
       setSecret(database, "wxpay_hook_token", randomAlphaNumeric(32));
 
-      audit(database, "setup.completed", { ip: clientIp(c.req.raw.headers) });
+      const session = createSession(database, userId, c.req.raw.headers, c.req.raw);
+      audit(database, "setup.completed", { actor: "admin", ip: clientIp(c.req.raw.headers, c.req.raw) });
       database.exec("COMMIT");
-      return c.json({ ok: true });
+      setAuthCookies(c, session);
+      return c.json({ ok: true, csrf_token: session.csrf });
     } catch (error) {
       database.exec("ROLLBACK");
       throw error;
@@ -140,7 +175,8 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
   });
 
   const handleLogin = async (c: any) => {
-    const ip = clientIp(c.req.raw.headers);
+    assertOriginAllowed(c.req.url, c.req.header("origin") || c.req.header("referer"), database);
+    const ip = clientIp(c.req.raw.headers, c.req.raw);
     const json = await c.req.json().catch(() => ({}));
     const parsed = loginSchema.safeParse(json);
     if (!parsed.success) throw new AppError(400, "VALIDATION_FAILED", "用户名或密码格式错误");
@@ -164,7 +200,7 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
     clearLoginFailures(rateLimitKey);
     clearLoginFailures(accountRateKey);
     if (ip) clearLoginFailures(`ip:${ip}`);
-    const session = createSession(database, user.id, c.req.raw.headers);
+    const session = createSession(database, user.id, c.req.raw.headers, c.req.raw);
     setAuthCookies(c, session);
     audit(database, "auth.login_success", { actor: user.username, ip });
     return c.json({
@@ -179,7 +215,8 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
   app.post("/auth/login", handleLogin);
 
   const handleLogout = (c: any) => {
-    const token = getCookie(c, SESSION_COOKIE);
+    assertOriginAllowed(c.req.url, c.req.header("origin") || c.req.header("referer"), database);
+    const token = getCookie(c, SESSION_COOKIE) ?? getCookie(c, "alimpay_session");
     if (token) database.query("DELETE FROM sessions WHERE token_hash = ?").run(sha256(token));
     clearAuthCookies(c);
     return c.json({ ok: true });
@@ -236,7 +273,7 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
       active_monitors: active.count,
       last_scan: lastScan ?? null,
       recent_orders: recentOrders,
-      configured: isGatewayReady(database),
+      configured: isGatewayReady(database, pub),
       alipay_configured: pub.alipay_configured,
       wxpay_configured: pub.wxpay_configured,
       collection_mode: pub.collection_mode,
@@ -272,7 +309,7 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
       actor: c.get("admin").username,
       targetType: "order",
       targetId: c.req.param("id"),
-      ip: clientIp(c.req.raw.headers),
+      ip: clientIp(c.req.raw.headers, c.req.raw),
     });
     return c.json({ ok: true, job_id: id }, 202);
   });
@@ -280,10 +317,18 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
   app.post("/orders/:id/mark-paid", (c) => {
     const order = getOrderById(database, c.req.param("id"));
     assert(order, 404, "ORDER_NOT_FOUND", "订单不存在");
+    const actor = c.get("admin").username;
     markOrderPaidDirectly(database, order.id, {
       channel: order.type,
       channelOrderId: `MANUAL-${Date.now()}`,
-      buyer: `admin:${c.get("admin").username}`,
+      buyer: `admin:${actor}`,
+    });
+    audit(database, "order.manual_mark_paid", {
+      actor,
+      targetType: "order",
+      targetId: order.id,
+      ip: clientIp(c.req.raw.headers, c.req.raw),
+      details: { trade_no: order.trade_no, out_trade_no: order.out_trade_no },
     });
     return c.json({ ok: true });
   });
@@ -309,7 +354,6 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
     has_wxpay_private_key: Boolean(getSecret(database, "wxpay_private_key")),
     has_wxpay_api_v3_key: Boolean(getSecret(database, "wxpay_api_v3_key")),
     has_wxpay_hook_token: Boolean(getSecret(database, "wxpay_hook_token")),
-    wxpay_hook_token: getSecret(database, "wxpay_hook_token"),
   }));
 
   app.put("/settings", async (c) => {
@@ -330,7 +374,12 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
     if (["f2f", "bill", "transfer"].includes(String(body.alipay_mode))) setSetting(database, "alipay_mode", body.alipay_mode);
     if (typeof body.alipay_app_id === "string") setSetting(database, "alipay_app_id", body.alipay_app_id.trim());
     if (typeof body.alipay_endpoint === "string") {
-      const endpoint = new URL(body.alipay_endpoint);
+      let endpoint: URL;
+      try {
+        endpoint = new URL(body.alipay_endpoint);
+      } catch {
+        throw new AppError(400, "INVALID_ALIPAY_ENDPOINT", "支付宝网关地址格式无效");
+      }
       assert(endpoint.protocol === "https:", 400, "INVALID_ALIPAY_ENDPOINT", "支付宝网关必须使用 HTTPS");
       setSetting(database, "alipay_endpoint", endpoint.toString().replace(/\/$/, ""));
     }
@@ -350,14 +399,14 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
       if (trimmedPub) validatePublicKey(trimmedPub);
       setSetting(database, "wxpay_public_key", trimmedPub ? toSpkiPublicKey(trimmedPub) : "");
     }
-    if (typeof body.wxpay_static_qr_url === "string") setSetting(database, "wxpay_static_qr_url", body.wxpay_static_qr_url.trim());
+    if (typeof body.wxpay_static_qr_url === "string") {
+      setSetting(database, "wxpay_static_qr_url", validateQrImageUrl(body.wxpay_static_qr_url));
+    }
     if (typeof body.wxpay_hook_token === "string") {
       const trimmedToken = body.wxpay_hook_token.trim();
       if (!trimmedToken) {
         if (!getSecret(database, "wxpay_hook_token")) {
           setSecret(database, "wxpay_hook_token", randomAlphaNumeric(32));
-        } else {
-          throw new AppError(400, "HOOK_TOKEN_REQUIRED", "为保障资金安全，Hook 鉴权 Token 不能为空");
         }
       } else {
         assert(trimmedToken.length >= 8, 400, "INVALID_HOOK_TOKEN", "Hook 鉴权 Token 长度至少为 8 位");
@@ -462,11 +511,11 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
     }
   });
 
-  app.post("/keys/alipay/generate", (c) => {
-    const pair = generateRsaKeyPair();
+  app.post("/keys/alipay/generate", async (c) => {
+    const pair = await generateRsaKeyPairAsync();
     setSecret(database, "alipay_private_key", pair.privateKey);
     setSetting(database, "alipay_app_public_key", pair.publicKey);
-    audit(database, "keys.alipay_generate", { actor: c.get("admin").username });
+    audit(database, "keys.alipay_generate", { actor: c.get("admin").username, ip: clientIp(c.req.raw.headers, c.req.raw) });
     return c.json({ private_key: pair.privateKey, public_key: pair.publicKey });
   });
 
@@ -475,11 +524,19 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
     assert(body.private_key, 400, "PRIVATE_KEY_REQUIRED", "应用私钥不能为空");
     validatePrivateKey(body.private_key);
     setSecret(database, "alipay_private_key", toPkcs8PrivateKey(body.private_key));
-    audit(database, "keys.alipay_import", { actor: c.get("admin").username });
+    audit(database, "keys.alipay_import", { actor: c.get("admin").username, ip: clientIp(c.req.raw.headers, c.req.raw) });
     return c.json({ ok: true });
   });
 
-  app.post("/keys/alipay/private/reveal", (c) => c.json({ private_key: getSecret(database, "alipay_private_key") }));
+  app.post("/keys/alipay/private/reveal", (c) => {
+    audit(database, "keys.alipay_private_reveal", { actor: c.get("admin").username, ip: clientIp(c.req.raw.headers, c.req.raw) });
+    return c.json({ private_key: getSecret(database, "alipay_private_key") });
+  });
+
+  app.post("/keys/wxpay/hook-token/reveal", (c) => {
+    audit(database, "keys.wxpay_hook_token_reveal", { actor: c.get("admin").username, ip: clientIp(c.req.raw.headers, c.req.raw) });
+    return c.json({ hook_token: getSecret(database, "wxpay_hook_token") });
+  });
 
   app.put("/keys/wxpay/secrets", async (c) => {
     const body = await c.req.json<{ private_key?: string; api_v3_key?: string; hook_token?: string }>();
@@ -498,7 +555,7 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
       assert(trimmedToken.length >= 8, 400, "INVALID_HOOK_TOKEN", "Hook 鉴权 Token 长度至少为 8 位且不能为空");
       setSecret(database, "wxpay_hook_token", trimmedToken);
     }
-    audit(database, "keys.wxpay_secrets", { actor: c.get("admin").username });
+    audit(database, "keys.wxpay_secrets", { actor: c.get("admin").username, ip: clientIp(c.req.raw.headers, c.req.raw) });
     return c.json({ ok: true });
   });
 
@@ -507,27 +564,30 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
     const key = randomAlphaNumeric(32);
     setSetting(database, "merchant_pid", pid);
     setSecret(database, "v1_key", key);
-    audit(database, "keys.v1_regenerate", { actor: c.get("admin").username });
+    audit(database, "keys.v1_regenerate", { actor: c.get("admin").username, ip: clientIp(c.req.raw.headers, c.req.raw) });
     return c.json({ pid, key });
   });
 
-  app.post("/keys/v1/reveal", (c) => c.json({
-    pid: getSetting(database, "merchant_pid", ""),
-    key: getSecret(database, "v1_key"),
-  }));
+  app.post("/keys/v1/reveal", (c) => {
+    audit(database, "keys.v1_reveal", { actor: c.get("admin").username, ip: clientIp(c.req.raw.headers, c.req.raw) });
+    return c.json({
+      pid: getSetting(database, "merchant_pid", ""),
+      key: getSecret(database, "v1_key"),
+    });
+  });
 
-  app.post("/keys/v2/platform/regenerate", (c) => {
-    const pair = generateRsaKeyPair();
+  app.post("/keys/v2/platform/regenerate", async (c) => {
+    const pair = await generateRsaKeyPairAsync();
     setSecret(database, "v2_platform_private_key", pair.privateKey);
     setSetting(database, "v2_platform_public_key", pair.publicKey);
-    audit(database, "keys.v2_platform_regenerate", { actor: c.get("admin").username });
+    audit(database, "keys.v2_platform_regenerate", { actor: c.get("admin").username, ip: clientIp(c.req.raw.headers, c.req.raw) });
     return c.json({ private_key: pair.privateKey, public_key: pair.publicKey });
   });
 
-  app.post("/keys/v2/merchant/generate", (c) => {
-    const pair = generateRsaKeyPair();
+  app.post("/keys/v2/merchant/generate", async (c) => {
+    const pair = await generateRsaKeyPairAsync();
     setSetting(database, "v2_merchant_public_key", pair.publicKey);
-    audit(database, "keys.v2_merchant_generate", { actor: c.get("admin").username });
+    audit(database, "keys.v2_merchant_generate", { actor: c.get("admin").username, ip: clientIp(c.req.raw.headers, c.req.raw) });
     return c.json({ private_key: pair.privateKey, public_key: pair.publicKey, one_time: true });
   });
 
@@ -584,7 +644,7 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
     }
 
     return c.json({
-      ready: isGatewayReady(database),
+      ready: isGatewayReady(database, pub),
       bun_version: Bun.version,
       database_path: getRuntimeEnv().databasePath,
       data_dir: getRuntimeEnv().dataDir,

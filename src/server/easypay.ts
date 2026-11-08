@@ -7,6 +7,7 @@ import { getSetting, type AppDatabase } from "./db";
 import { AppError, assert } from "./errors";
 import {
   createOrder,
+  createTransferUri,
   findOrder,
   getOrderById,
   listOrders,
@@ -38,7 +39,13 @@ async function requestParameters(c: Context): Promise<Parameters> {
 }
 
 function errorMessage(error: unknown) {
-  return error instanceof Error ? error.message : "请求处理失败";
+  if (error instanceof AppError) return error.message;
+  console.error(JSON.stringify({
+    level: "error",
+    event: "easypay_unexpected_error",
+    message: error instanceof Error ? error.message : String(error),
+  }));
+  return "请求处理失败";
 }
 
 function publicBaseUrl(database: AppDatabase) {
@@ -154,21 +161,37 @@ async function refreshedOrder(database: AppDatabase, scanner: PaymentScanner, pa
   return null;
 }
 
+const TAIPEI_DAY_FORMATTER = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Asia/Taipei",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+
 function merchantStats(database: AppDatabase) {
-  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Taipei", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date());
+  const parts = TAIPEI_DAY_FORMATTER.formatToParts(new Date());
   const part = (type: Intl.DateTimeFormatPartTypes) => parts.find((item) => item.type === type)?.value ?? "";
   const todayIso = new Date(`${part("year")}-${part("month")}-${part("day")}T00:00:00+08:00`).toISOString();
   const yesterdayIso = new Date(Date.parse(todayIso) - 86_400_000).toISOString();
   const total = (database.query("SELECT COUNT(*) AS count FROM orders").get() as { count: number }).count;
-  const today = database.query(`
-    SELECT COUNT(*) AS count, COALESCE(SUM(CASE WHEN status IN ('paid','late_paid') THEN requested_amount_cents ELSE 0 END), 0) AS cents
+  const windowRow = database.query(`
+    SELECT
+      COALESCE(SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END), 0) AS today_count,
+      COALESCE(SUM(CASE WHEN created_at >= ? AND status IN ('paid','late_paid') THEN requested_amount_cents ELSE 0 END), 0) AS today_cents,
+      COALESCE(SUM(CASE WHEN created_at < ? THEN 1 ELSE 0 END), 0) AS yesterday_count,
+      COALESCE(SUM(CASE WHEN created_at < ? AND status IN ('paid','late_paid') THEN requested_amount_cents ELSE 0 END), 0) AS yesterday_cents
     FROM orders WHERE created_at >= ?
-  `).get(todayIso) as { count: number; cents: number };
-  const yesterday = database.query(`
-    SELECT COUNT(*) AS count, COALESCE(SUM(CASE WHEN status IN ('paid','late_paid') THEN requested_amount_cents ELSE 0 END), 0) AS cents
-    FROM orders WHERE created_at >= ? AND created_at < ?
-  `).get(yesterdayIso, todayIso) as { count: number; cents: number };
-  return { total, today, yesterday };
+  `).get(todayIso, todayIso, todayIso, todayIso, yesterdayIso) as {
+    today_count: number;
+    today_cents: number;
+    yesterday_count: number;
+    yesterday_cents: number;
+  };
+  return {
+    total,
+    today: { count: windowRow.today_count, cents: windowRow.today_cents },
+    yesterday: { count: windowRow.yesterday_count, cents: windowRow.yesterday_cents },
+  };
 }
 
 export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScanner) {
@@ -207,7 +230,6 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
         if (order.collection_mode === "alipay_f2f" && order.channel_qr_payload) {
           result.urlscheme = `alipays://platformapi/startapp?appId=20000067&url=${encodeURIComponent(order.channel_qr_payload)}`;
         } else if (order.collection_mode === "alipay_transfer" || order.collection_mode === "transfer") {
-          const { createTransferUri } = await import("./orders");
           result.qrcode = createTransferUri(
             order,
             getSetting(database, "transfer_user_id", ""),
@@ -286,7 +308,6 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
         payType = "qrcode";
         payInfo = order.channel_qr_payload;
       } else if (order.collection_mode === "alipay_transfer" || order.collection_mode === "transfer") {
-        const { createTransferUri } = await import("./orders");
         payType = "qrcode";
         payInfo = createTransferUri(
           order,
@@ -389,7 +410,9 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
         const outTradeNo = String(decrypted.out_trade_no ?? "");
         const tradeState = String(decrypted.trade_state ?? "");
         if (tradeState === "SUCCESS" && outTradeNo) {
-          const order = database.query("SELECT * FROM orders WHERE type = 'wxpay' AND (trade_no = ? OR out_trade_no = ?)").get(outTradeNo, outTradeNo) as OrderRecord | null;
+          const order = database.query(
+            "SELECT * FROM orders WHERE type = 'wxpay' AND collection_mode = 'wxpay_native' AND trade_no = ?",
+          ).get(outTradeNo) as OrderRecord | null;
           if (order) {
             const paidCents = Number((decrypted.amount as Record<string, unknown> | undefined)?.total);
             if (!Number.isInteger(paidCents) || paidCents !== order.payable_amount_cents) {
@@ -406,16 +429,21 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
       }
       return c.json({ code: "SUCCESS", message: "成功" });
     } catch (error) {
-      if (error instanceof AppError && error.status === 401) {
-        return c.json({ code: "FAIL", message: error.message }, 401);
+      if (error instanceof AppError) {
+        return c.json({ code: "FAIL", message: error.message }, error.status as 400 | 401 | 500 | 503);
       }
+      console.error(JSON.stringify({
+        level: "error",
+        event: "wxpay_notify_error",
+        message: error instanceof Error ? error.message : String(error),
+      }));
       return c.json({ code: "FAIL", message: "失败" }, 500);
     }
   });
 
   // PC WeChat Hook endpoint health check & connectivity diagnostics
   app.get("/api/hook/receive", async (c) => {
-    const ip = clientIp(c.req.raw.headers) || "unknown";
+    const ip = clientIp(c.req.raw.headers, c.req.raw) || "unknown";
     const rateKey = `hook:${ip}`;
     checkLoginRateLimit(rateKey);
 
@@ -462,28 +490,36 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
   // PC WeChat Hook / SweetCheckout Hook receiver
   app.post("/api/hook/receive", async (c) => {
     try {
-      const ip = clientIp(c.req.raw.headers) || "unknown";
+      const ip = clientIp(c.req.raw.headers, c.req.raw) || "unknown";
       const rateKey = `hook:${ip}`;
       checkLoginRateLimit(rateKey);
 
       const body = ((await c.req.json().catch(() => ({}))) ?? {}) as Record<string, unknown>;
-      const type = String(body.type ?? "wechat").toLowerCase();
-      const money = String(body.money ?? "").trim();
+      const type = String(body.type ?? "wechat").toLowerCase().slice(0, 32);
+      const money = String(body.money ?? "").trim().slice(0, 32);
       const queryToken = c.req.query("token") ?? "";
       const headerToken = c.req.header("x-hook-token") ?? c.req.header("authorization")?.replace(/^Bearer\s+/i, "") ?? "";
       const token = String(body.token ?? (queryToken || headerToken)).trim();
-      const ua = c.req.header("user-agent") || "unknown";
+      const ua = (c.req.header("user-agent") || "unknown").slice(0, 160);
 
-      console.info(`[Hook] 收到 Hook 回调请求: type=${type}, money=${money}, ua=${ua}, ip=${ip}, has_token=${Boolean(token)}`);
+      console.info(JSON.stringify({
+        level: "info",
+        event: "hook_received",
+        type,
+        money,
+        ip,
+        ua,
+        has_token: Boolean(token),
+      }));
 
       const expectedToken = getSecret(database, "wxpay_hook_token");
       if (!expectedToken) {
-        console.error(`[Hook] 拒绝请求: 尚未配置 wxpay_hook_token (来源 IP=${ip})`);
+        console.error(JSON.stringify({ level: "error", event: "hook_unconfigured", ip }));
         return c.json({ code: -1, msg: "hook token not configured" }, 503);
       }
       if (!checkHookTokenMatch(token, expectedToken)) {
         recordLoginFailure(rateKey);
-        console.warn(`[Hook] Token 鉴权失败: 来源 IP=${ip}`);
+        console.warn(JSON.stringify({ level: "warn", event: "hook_auth_failed", ip }));
         return c.json({ code: -1, msg: "invalid hook token" }, 401);
       }
       clearLoginFailures(rateKey);
@@ -495,6 +531,7 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
       const cleanMoney = money.replace(/^[￥¥\$\s]+/, "").trim();
       const amountCents = parseMoneyToCents(cleanMoney);
       const targetChannel = type === "wechat" || type === "wxpay" ? "wxpay" : "alipay";
+      const targetCollectionMode = targetChannel === "wxpay" ? "wxpay_hook" : "business_qr";
       const rawEventId = String(body.event_id ?? "").trim();
       const eventId = /^[A-Za-z0-9_:\-]{1,128}$/.test(rawEventId) ? rawEventId : "";
 
@@ -505,16 +542,21 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
         }
       }
 
-      // Match pending order by payable_amount_cents
+      // Match pending order strictly within Hook-eligible collection mode (never official native/f2f/transfer)
       const candidate = database.query(`
         SELECT * FROM orders
-        WHERE type = ? AND status IN ('pending', 'expired') AND payable_amount_cents = ? AND monitor_until > ?
+        WHERE type = ? AND collection_mode = ? AND status IN ('pending', 'expired') AND payable_amount_cents = ? AND monitor_until > ?
         ORDER BY created_at ASC LIMIT 1
-      `).get(targetChannel, amountCents, new Date().toISOString()) as OrderRecord | null;
+      `).get(targetChannel, targetCollectionMode, amountCents, new Date().toISOString()) as OrderRecord | null;
 
       if (!candidate) {
-        console.warn(`[Hook] 未找到匹配的待支付订单: 金额=¥${money} (${amountCents}分), 通道=${targetChannel}`);
-        return c.json({ code: 0, msg: "未找到待支付的匹配订单", money, type: targetChannel });
+        console.warn(JSON.stringify({
+          level: "warn",
+          event: "hook_unmatched",
+          channel: targetChannel,
+          amount_cents: amountCents,
+        }));
+        return c.json({ code: 0, msg: "未找到待支付的匹配订单", money: cleanMoney, type: targetChannel });
       }
 
       const paid = markOrderPaidDirectly(database, candidate.id, {
@@ -533,7 +575,13 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
         return c.json({ code: 0, msg: "订单状态已变化" }, 409);
       }
 
-      console.info(`[Hook] 收款成功匹配订单: trade_no=${candidate.trade_no}, out_trade_no=${candidate.out_trade_no}, 金额=¥${cleanMoney}`);
+      console.info(JSON.stringify({
+        level: "info",
+        event: "hook_matched",
+        trade_no: candidate.trade_no,
+        out_trade_no: candidate.out_trade_no,
+        amount_cents: amountCents,
+      }));
 
       return c.json({
         code: 1,
@@ -545,8 +593,12 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
       if (error instanceof AppError) {
         return c.json({ code: -1, msg: error.message }, error.status as 400 | 401 | 403 | 429 | 500 | 503);
       }
-      console.error(`[Hook] 处理回调异常:`, error);
-      return c.json({ code: -1, msg: errorMessage(error) }, 500);
+      console.error(JSON.stringify({
+        level: "error",
+        event: "hook_unexpected_error",
+        message: error instanceof Error ? error.message : String(error),
+      }));
+      return c.json({ code: -1, msg: "请求处理失败" }, 500);
     }
   });
 

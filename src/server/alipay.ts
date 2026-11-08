@@ -31,6 +31,8 @@ export function prepareAlipaySdkPem(value: string) {
 }
 
 export class OfficialAlipayProvider implements AccountLogProvider {
+  private cachedSdk: { key: string; sdk: AlipaySdk } | null = null;
+
   constructor(private readonly database: AppDatabase) {}
 
   getSdk(): AlipaySdk {
@@ -41,16 +43,24 @@ export class OfficialAlipayProvider implements AccountLogProvider {
       throw new AppError(503, "ALIPAY_NOT_CONFIGURED", "支付宝应用 ID、应用私钥或支付宝公钥尚未配置完整");
     }
 
-    return new AlipaySdk({
+    const endpoint = getSetting(this.database, "alipay_endpoint", "https://openapi.alipay.com");
+    const cacheKey = `${appId}\n${endpoint}\n${privateKey}\n${alipayPublicKey}`;
+    if (this.cachedSdk?.key === cacheKey) {
+      return this.cachedSdk.sdk;
+    }
+
+    const sdk = new AlipaySdk({
       appId,
       privateKey: prepareAlipaySdkPem(privateKey),
       alipayPublicKey: prepareAlipaySdkPem(alipayPublicKey),
       signType: "RSA2",
       keyType: "PKCS8",
-      endpoint: getSetting(this.database, "alipay_endpoint", "https://openapi.alipay.com"),
+      endpoint,
       timeout: 8_000,
       camelcase: false,
     });
+    this.cachedSdk = { key: cacheKey, sdk };
+    return sdk;
   }
 
   async query(input: { startTime: string; endTime: string; pageNo: number; pageSize: number }): Promise<AccountLogPage> {
@@ -130,19 +140,33 @@ export function parseAlipayTime(value: unknown) {
   return new Date(`${raw.replace(" ", "T")}+08:00`).toISOString();
 }
 
+const SHANGHAI_DATE_FORMATTER = new Intl.DateTimeFormat("sv-SE", {
+  timeZone: "Asia/Shanghai",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false,
+});
+
 function formatShanghai(value: Date) {
-  const parts = new Intl.DateTimeFormat("sv-SE", {
-    timeZone: "Asia/Shanghai",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).formatToParts(value);
+  const parts = SHANGHAI_DATE_FORMATTER.formatToParts(value);
   const part = (type: Intl.DateTimeFormatPartTypes) => parts.find((item) => item.type === type)?.value ?? "";
   return `${part("year")}-${part("month")}-${part("day")} ${part("hour")}:${part("minute")}:${part("second")}`;
+}
+
+async function runWithConcurrency<T>(items: T[], concurrency: number, worker: (item: T) => Promise<void>) {
+  if (items.length === 0) return;
+  let index = 0;
+  const runners = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (index < items.length) {
+      const current = items[index++]!;
+      await worker(current);
+    }
+  });
+  await Promise.all(runners);
 }
 
 function normalizeEvent(detail: Record<string, unknown>): AccountLogEvent | null {
@@ -178,7 +202,10 @@ export interface ScanResult {
 export class PaymentScanner {
   private inFlight: Promise<ScanResult> | null = null;
   private lastCompletedAt = 0;
+  private lastRetentionPruneAt = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
+  private readonly orderCheckInFlight = new Map<string, Promise<boolean>>();
+  private readonly orderLastCheckedAt = new Map<string, number>();
   private readonly wechat: WeChatPayService;
 
   constructor(
@@ -210,37 +237,66 @@ export class PaymentScanner {
     this.timer = null;
   }
 
+  private async checkDirectOrder(order: OrderRecord): Promise<boolean> {
+    const existing = this.orderCheckInFlight.get(order.id);
+    if (existing) return existing;
+
+    const task = (async () => {
+      try {
+        if (order.collection_mode === "alipay_f2f" && this.provider.queryTrade) {
+          const query = await this.provider.queryTrade(order.trade_no);
+          if (query.success && query.amountCents === order.payable_amount_cents) {
+            return markOrderPaidDirectly(this.database, order.id, {
+              channel: "alipay",
+              channelOrderId: query.tradeNo,
+              buyer: query.buyerId,
+            });
+          }
+        } else if (order.collection_mode === "wxpay_native") {
+          const query = await this.wechat.queryOrder(order.trade_no);
+          if (query.tradeState === "SUCCESS" && query.amountCents === order.payable_amount_cents) {
+            return markOrderPaidDirectly(this.database, order.id, {
+              channel: "wxpay",
+              channelOrderId: query.transactionId,
+              buyer: query.payerOpenid,
+            });
+          }
+        }
+        return false;
+      } catch {
+        return false;
+      } finally {
+        if (this.orderLastCheckedAt.size > 1_024) {
+          const oldestKey = this.orderLastCheckedAt.keys().next().value;
+          if (oldestKey !== undefined) this.orderLastCheckedAt.delete(oldestKey);
+        }
+        this.orderLastCheckedAt.set(order.id, Date.now());
+        this.orderCheckInFlight.delete(order.id);
+      }
+    })();
+
+    this.orderCheckInFlight.set(order.id, task);
+    return task;
+  }
+
   async ensureFresh(order: OrderRecord) {
     if (!["pending", "expired"].includes(order.status) || Date.parse(order.monitor_until) <= Date.now()) return;
 
-    // Fast path: direct active query for F2F or WeChat Native
-    if (order.collection_mode === "alipay_f2f" && this.provider.queryTrade) {
-      try {
-        const query = await this.provider.queryTrade(order.trade_no);
-        if (query.success && (query.amountCents === undefined || query.amountCents === order.payable_amount_cents)) {
-          markOrderPaidDirectly(this.database, order.id, {
-            channel: "alipay",
-            channelOrderId: query.tradeNo,
-            buyer: query.buyerId,
-          });
-          return;
-        }
-      } catch { /* proceed */ }
-    } else if (order.collection_mode === "wxpay_native") {
-      try {
-        const query = await this.wechat.queryOrder(order.trade_no);
-        if (query.tradeState === "SUCCESS" && query.amountCents === order.payable_amount_cents) {
-          markOrderPaidDirectly(this.database, order.id, {
-            channel: "wxpay",
-            channelOrderId: query.transactionId,
-            buyer: query.payerOpenid,
-          });
-          return;
-        }
-      } catch { /* proceed */ }
+    const pollIntervalMs = getPaymentPollIntervalSeconds(this.database) * 1_000;
+    const isDirectMode =
+      (order.collection_mode === "alipay_f2f" && Boolean(this.provider.queryTrade)) ||
+      order.collection_mode === "wxpay_native";
+
+    // Fast path: direct active query for F2F or WeChat Native with per-order coalescing & cooldown
+    if (isDirectMode) {
+      const fastCooldownMs = Math.min(1_500, pollIntervalMs);
+      if (this.orderCheckInFlight.has(order.id) || Date.now() - (this.orderLastCheckedAt.get(order.id) ?? 0) >= fastCooldownMs) {
+        await this.checkDirectOrder(order);
+      }
+      return;
     }
 
-    if (Date.now() - this.lastCompletedAt < getPaymentPollIntervalSeconds(this.database) * 1_000) return;
+    if (Date.now() - this.lastCompletedAt < pollIntervalMs) return;
     await Promise.race([
       this.scanNow("order_query"),
       new Promise<void>((resolve) => setTimeout(resolve, 3_000)),
@@ -256,7 +312,18 @@ export class PaymentScanner {
     return this.inFlight;
   }
 
+  private maybePruneHistoricalRows() {
+    const nowMs = Date.now();
+    if (nowMs - this.lastRetentionPruneAt < 60 * 60_000) return;
+    this.lastRetentionPruneAt = nowMs;
+    const hookCutoff = new Date(nowMs - 30 * 86_400_000).toISOString();
+    const scanCutoff = new Date(nowMs - 7 * 86_400_000).toISOString();
+    this.database.query("DELETE FROM hook_events WHERE created_at < ?").run(hookCutoff);
+    this.database.query("DELETE FROM scan_runs WHERE started_at < ? AND id NOT IN (SELECT id FROM scan_runs ORDER BY id DESC LIMIT 1000)").run(scanCutoff);
+  }
+
   private async performScan(reason: string): Promise<ScanResult> {
+    this.maybePruneHistoricalRows();
     let candidates = getActiveOrders(this.database);
     const startedAt = new Date().toISOString();
     const run = this.database.query(`
@@ -274,41 +341,27 @@ export class PaymentScanner {
     let matched = 0;
     let traceId = "";
 
-    // 1. Check F2F orders
+    // 1. Check F2F orders with bounded concurrency
     if (this.provider.queryTrade) {
       const f2fOrders = candidates.filter((o) => o.collection_mode === "alipay_f2f");
-      for (const order of f2fOrders) {
-        try {
-          const res = await this.provider.queryTrade(order.trade_no);
-          if (res.success && (res.amountCents === undefined || res.amountCents === order.payable_amount_cents)) {
-            const ok = markOrderPaidDirectly(this.database, order.id, {
-              channel: "alipay",
-              channelOrderId: res.tradeNo,
-              buyer: res.buyerId,
-            });
-            if (ok) matched += 1;
-          }
-        } catch { /* ignore individual query errors */ }
+      if (f2fOrders.length > 0) {
+        await runWithConcurrency(f2fOrders, 5, async (order) => {
+          const ok = await this.checkDirectOrder(order);
+          if (ok) matched += 1;
+        });
+        candidates = getActiveOrders(this.database);
       }
-      candidates = getActiveOrders(this.database);
     }
 
-    // 2. Check WeChat Native orders
+    // 2. Check WeChat Native orders with bounded concurrency
     const wxOrders = candidates.filter((o) => o.collection_mode === "wxpay_native");
-    for (const order of wxOrders) {
-      try {
-        const res = await this.wechat.queryOrder(order.trade_no);
-        if (res.tradeState === "SUCCESS" && res.amountCents === order.payable_amount_cents) {
-          const ok = markOrderPaidDirectly(this.database, order.id, {
-            channel: "wxpay",
-            channelOrderId: res.transactionId,
-            buyer: res.payerOpenid,
-          });
-          if (ok) matched += 1;
-        }
-      } catch { /* ignore individual query errors */ }
+    if (wxOrders.length > 0) {
+      await runWithConcurrency(wxOrders, 5, async (order) => {
+        const ok = await this.checkDirectOrder(order);
+        if (ok) matched += 1;
+      });
+      candidates = getActiveOrders(this.database);
     }
-    candidates = getActiveOrders(this.database);
 
     // 3. Check bill query candidates (business_qr, transfer)
     const billCandidates = candidates.filter((o) => ["business_qr", "transfer", "alipay_bill", "alipay_transfer"].includes(o.collection_mode));

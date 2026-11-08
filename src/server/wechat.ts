@@ -2,7 +2,9 @@ import crypto from "node:crypto";
 import { getSecret } from "./config";
 import { getSetting, type AppDatabase } from "./db";
 import { AppError } from "./errors";
-import { normalizePem } from "./security";
+import { getCachedPrivateKey, getCachedPublicKey } from "./security";
+
+const WXPAY_API_TIMEOUT_MS = 8_000;
 
 export interface WeChatPrepayResult {
   codeUrl: string;
@@ -39,7 +41,7 @@ export class WeChatPayService {
 
     const sign = crypto.createSign("RSA-SHA256");
     sign.update(message);
-    const signature = sign.sign(privateKey, "base64");
+    const signature = sign.sign(getCachedPrivateKey(privateKey), "base64");
 
     return `WECHATPAY2-SHA256-RSA2048 mchid="${mchId}",nonce_str="${nonce}",signature="${signature}",timestamp="${timestamp}",serial_no="${serialNo}"`;
   }
@@ -75,6 +77,7 @@ export class WeChatPayService {
         Authorization: auth,
       },
       body: bodyStr,
+      signal: AbortSignal.timeout(WXPAY_API_TIMEOUT_MS),
     });
 
     const resJson = await res.json().catch(() => ({})) as Record<string, unknown>;
@@ -99,6 +102,7 @@ export class WeChatPayService {
         Accept: "application/json",
         Authorization: auth,
       },
+      signal: AbortSignal.timeout(WXPAY_API_TIMEOUT_MS),
     });
 
     const resJson = await res.json().catch(() => ({})) as Record<string, unknown>;
@@ -122,32 +126,33 @@ export class WeChatPayService {
   }
 
   verifyNotificationSignature(headers: Headers, rawBody: string): void {
+    const platformPublicKey = getSetting(this.database, "wxpay_public_key", "").trim();
+    if (!platformPublicKey) {
+      throw new AppError(503, "WXPAY_PUBLIC_KEY_MISSING", "尚未配置微信支付平台公钥或证书，已拒绝未验签回调");
+    }
+
     const timestamp = headers.get("wechatpay-timestamp")?.trim() ?? "";
     const nonce = headers.get("wechatpay-nonce")?.trim() ?? "";
     const signature = headers.get("wechatpay-signature")?.trim() ?? "";
-    const platformPublicKey = getSetting(this.database, "wxpay_public_key", "").trim();
-
-    if (timestamp) {
-      if (!/^\d{10}$/.test(timestamp) || Math.abs(Math.floor(Date.now() / 1000) - Number(timestamp)) > 300) {
-        throw new AppError(401, "WXPAY_TIMESTAMP_EXPIRED", "微信回调时间戳无效或已过期");
-      }
+    if (!timestamp || !nonce || !signature) {
+      throw new AppError(401, "WXPAY_SIGNATURE_MISSING", "缺少微信支付回调签名头");
+    }
+    if (!/^\d{10}$/.test(timestamp) || Math.abs(Math.floor(Date.now() / 1000) - Number(timestamp)) > 300) {
+      throw new AppError(401, "WXPAY_TIMESTAMP_EXPIRED", "微信回调时间戳无效或已过期");
     }
 
-    if (platformPublicKey) {
-      if (!timestamp || !nonce || !signature) {
-        throw new AppError(401, "WXPAY_SIGNATURE_MISSING", "缺少微信支付回调签名头");
-      }
-      const message = `${timestamp}\n${nonce}\n${rawBody}\n`;
-      const pem = platformPublicKey.includes("-----BEGIN CERTIFICATE-----")
-        ? platformPublicKey
-        : normalizePem(platformPublicKey, "public");
+    const message = `${timestamp}\n${nonce}\n${rawBody}\n`;
+    let valid = false;
+    try {
       const verifier = crypto.createVerify("RSA-SHA256");
       verifier.update(message, "utf8");
       verifier.end();
-      const valid = verifier.verify(crypto.createPublicKey(pem), signature, "base64");
-      if (!valid) {
-        throw new AppError(401, "WXPAY_INVALID_SIGNATURE", "微信支付平台签名校验失败");
-      }
+      valid = verifier.verify(getCachedPublicKey(platformPublicKey), signature, "base64");
+    } catch {
+      valid = false;
+    }
+    if (!valid) {
+      throw new AppError(401, "WXPAY_INVALID_SIGNATURE", "微信支付平台签名校验失败");
     }
   }
 
@@ -165,6 +170,7 @@ export class WeChatPayService {
         Authorization: auth,
       },
       body: bodyStr,
+      signal: AbortSignal.timeout(WXPAY_API_TIMEOUT_MS),
     }).catch(() => undefined);
   }
 
@@ -173,8 +179,14 @@ export class WeChatPayService {
     if (!apiV3Key || apiV3Key.length !== 32) {
       throw new AppError(500, "WXPAY_KEY_INVALID", "微信 APIv3 Key 长度必须为 32 位");
     }
+    if (Buffer.byteLength(nonce, "utf-8") !== 12) {
+      throw new AppError(400, "WXPAY_INVALID_NONCE", "微信回调 Nonce 长度无效");
+    }
 
     const cipherBuffer = Buffer.from(ciphertext, "base64");
+    if (cipherBuffer.length <= 16) {
+      throw new AppError(400, "WXPAY_INVALID_CIPHERTEXT", "微信回调密文长度无效");
+    }
     const authTag = cipherBuffer.subarray(cipherBuffer.length - 16);
     const encryptedData = cipherBuffer.subarray(0, cipherBuffer.length - 16);
 

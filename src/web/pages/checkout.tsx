@@ -42,7 +42,7 @@ export function CheckoutPage() {
         // 活跃等待期间加快轮询频率到 1.5 秒，确保客户扫码支付后秒级感知并自动跳转
         return Math.min(baseInterval, 1_500);
       },
-      refreshWhenHidden: true,
+      refreshWhenHidden: false,
       revalidateOnFocus: true,
       revalidateOnReconnect: true,
       shouldRetryOnError: false,
@@ -66,18 +66,20 @@ export function CheckoutPage() {
       }),
   );
 
-  // 1. 本地时钟推进
+  const paid = data?.status === "paid" || data?.status === "late_paid";
+  const isTerminal = paid || Boolean(data && now >= Date.parse(data.monitor_until));
+
+  // 1. 本地时钟推进（订单进入终态后自动停止定时器）
   useEffect(() => {
+    if (isTerminal) return;
     const timer = window.setInterval(() => setNow(Date.now()), 1_000);
     return () => window.clearInterval(timer);
-  }, []);
-
-  const paid = data?.status === "paid" || data?.status === "late_paid";
+  }, [isTerminal]);
 
   // 2. 屏幕防息屏休眠锁 (Screen Wake Lock API)
   // 当等待付款时，阻止移动端或电脑屏幕自动变暗或熄屏睡眠
   useEffect(() => {
-    if (paid || typeof navigator === "undefined" || !("wakeLock" in navigator)) return;
+    if (isTerminal || typeof navigator === "undefined" || !("wakeLock" in navigator)) return;
     let wakeLock: any = null;
     const requestLock = async () => {
       try {
@@ -101,20 +103,22 @@ export function CheckoutPage() {
         void wakeLock.release().catch(() => {});
       }
     };
-  }, [paid]);
+  }, [isTerminal]);
 
-  // 3. Web Worker 后台独立心跳（打破移动端/浏览器切后台后的主线程定时器休眠与节流）
+  // 3. Web Worker 后台独立心跳（仅在页面切入后台 hidden 时补偿轮询，避免与前台 SWR 叠加发双倍请求）
   useEffect(() => {
-    if (paid || typeof Worker === "undefined" || typeof Blob === "undefined") return;
+    if (isTerminal || typeof Worker === "undefined" || typeof Blob === "undefined") return;
     let worker: Worker | null = null;
     let workerUrl = "";
     try {
-      const code = "setInterval(function() { postMessage('tick'); }, 1500);";
+      const code = "setInterval(function() { postMessage('tick'); }, 2000);";
       const blob = new Blob([code], { type: "application/javascript" });
       workerUrl = URL.createObjectURL(blob);
       worker = new Worker(workerUrl);
       worker.onmessage = () => {
-        void mutate();
+        if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+          void mutate();
+        }
       };
     } catch {
       // 若受安全策略限制则由外部机制兜底
@@ -127,34 +131,41 @@ export function CheckoutPage() {
         URL.revokeObjectURL(workerUrl);
       }
     };
-  }, [paid, mutate]);
+  }, [isTerminal, mutate]);
 
-  // 4. 休眠看门狗与全生命周期唤醒补偿（pageshow、visibilitychange、focus、触摸感知）
+  // 4. 休眠看门狗与全生命周期唤醒补偿（带 1s 节流，杜绝触摸滑动风暴）
   useEffect(() => {
-    if (paid) return;
+    if (isTerminal) return;
     let lastTime = Date.now();
+    let lastWakeMutateAt = 0;
+
+    const throttledMutate = () => {
+      const current = Date.now();
+      if (current - lastWakeMutateAt < 1_000) return;
+      lastWakeMutateAt = current;
+      void mutate();
+    };
+
     // 监测系统时钟跳变：若两次心跳相隔超过 2.5 秒，说明系统发生过息屏休眠或切后台挂起
     const watchdog = window.setInterval(() => {
       const currentTime = Date.now();
-      if (currentTime - lastTime > 2500) {
-        // 从休眠中苏醒，立即无延迟强制刷新订单状态
-        void mutate();
+      if (currentTime - lastTime > 2_500) {
+        throttledMutate();
       }
       lastTime = currentTime;
-    }, 500);
+    }, 1_000);
 
     const handleWakeup = () => {
       lastTime = Date.now();
-      void mutate();
+      if (typeof document === "undefined" || document.visibilityState === "visible") {
+        throttledMutate();
+      }
     };
 
     document.addEventListener("visibilitychange", handleWakeup);
     window.addEventListener("pageshow", handleWakeup);
     window.addEventListener("focus", handleWakeup);
     window.addEventListener("online", handleWakeup);
-    // 移动端切回浏览器通常第一反应是触碰屏幕，触碰即刷
-    window.addEventListener("touchstart", handleWakeup, { passive: true });
-    window.addEventListener("pointerdown", handleWakeup, { passive: true });
 
     return () => {
       window.clearInterval(watchdog);
@@ -162,10 +173,8 @@ export function CheckoutPage() {
       window.removeEventListener("pageshow", handleWakeup);
       window.removeEventListener("focus", handleWakeup);
       window.removeEventListener("online", handleWakeup);
-      window.removeEventListener("touchstart", handleWakeup);
-      window.removeEventListener("pointerdown", handleWakeup);
     };
-  }, [paid, mutate]);
+  }, [isTerminal, mutate]);
 
   // 5. 支付成功后自动跳转商户（包含倒计时与即时返回）
   useEffect(() => {
