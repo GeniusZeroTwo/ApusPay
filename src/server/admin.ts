@@ -35,6 +35,7 @@ import { notificationHistory, queueManualNotification } from "./notifications";
 import { getOrderById, listOrders, markOrderPaidDirectly } from "./orders";
 import {
   generateRsaKeyPairAsync,
+  parseBoundedInt,
   randomAlphaNumeric,
   randomMerchantPid,
   sha256,
@@ -285,8 +286,8 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
     if (status && !["pending", "expired", "paid", "late_paid"].includes(status)) {
       throw new AppError(400, "INVALID_STATUS", "订单状态筛选值无效");
     }
-    const page = Math.max(1, Number(c.req.query("page") ?? 1));
-    const limit = Math.min(100, Math.max(1, Number(c.req.query("limit") ?? 20)));
+    const page = parseBoundedInt(c.req.query("page"), 1, 1, 1_000_000);
+    const limit = parseBoundedInt(c.req.query("limit"), 20, 1, 100);
     const result = listOrders(database, {
       status,
       query: c.req.query("q")?.trim(),
@@ -339,7 +340,7 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
   });
 
   app.get("/scans", (c) => {
-    const limit = Math.min(100, Math.max(1, Number(c.req.query("limit") ?? 30)));
+    const limit = parseBoundedInt(c.req.query("limit"), 30, 1, 100);
     return c.json({ data: database.query("SELECT * FROM scan_runs ORDER BY id DESC LIMIT ?").all(limit) });
   });
 
@@ -596,7 +597,7 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
     assert(body.public_key, 400, "PUBLIC_KEY_REQUIRED", "商户公钥不能为空");
     validatePublicKey(body.public_key);
     setSetting(database, "v2_merchant_public_key", toSpkiPublicKey(body.public_key));
-    audit(database, "keys.v2_merchant_import", { actor: c.get("admin").username });
+    audit(database, "keys.v2_merchant_import", { actor: c.get("admin").username, ip: clientIp(c.req.raw.headers, c.req.raw) });
     return c.json({ ok: true });
   });
 
@@ -614,7 +615,7 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
     } else {
       database.query("DELETE FROM sessions WHERE user_id = ?").run(c.get("admin").id);
     }
-    audit(database, "system.password_changed", { actor: c.get("admin").username, ip: clientIp(c.req.raw.headers) });
+    audit(database, "system.password_changed", { actor: c.get("admin").username, ip: clientIp(c.req.raw.headers, c.req.raw) });
     return c.json({ ok: true });
   };
 
@@ -684,7 +685,7 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
   });
 
   app.get("/system/audits", (c) => {
-    const limit = Math.min(100, Math.max(1, Number(c.req.query("limit") ?? 50)));
+    const limit = parseBoundedInt(c.req.query("limit"), 50, 1, 100);
     return c.json({ data: database.query("SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?").all(limit) });
   });
 

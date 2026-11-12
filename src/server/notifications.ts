@@ -76,11 +76,22 @@ function pinnedHttpGet(
         },
         ...(isHttps && isIP(normalizedHost) === 0 ? { servername: normalizedHost } : {}),
         lookup: (_hostname, options, callback) => {
-          const opts = typeof options === "object" && options !== null ? options : {};
-          if ((opts as { all?: boolean }).all) {
-            (callback as (err: NodeJS.ErrnoException | null, addresses: LookupAddress[]) => void)(null, pinnedAddresses);
+          const opts = typeof options === "object" && options !== null ? (options as { all?: boolean; family?: number }) : {};
+          const requestedFamily = typeof options === "number"
+            ? (options === 4 || options === 6 ? options : undefined)
+            : (opts.family === 4 || opts.family === 6 ? opts.family : undefined);
+          const candidates = requestedFamily
+            ? pinnedAddresses.filter((entry) => entry.family === requestedFamily)
+            : pinnedAddresses;
+          if (candidates.length === 0) {
+            const err = Object.assign(new Error("ENOTFOUND: no matching address family"), { code: "ENOTFOUND" });
+            (callback as (err: NodeJS.ErrnoException | null, addresses: unknown) => void)(err, opts.all ? [] : undefined);
+            return;
+          }
+          if (opts.all) {
+            (callback as (err: NodeJS.ErrnoException | null, addresses: LookupAddress[]) => void)(null, candidates);
           } else {
-            const first = pinnedAddresses[0]!;
+            const first = candidates[0]!;
             (callback as (err: NodeJS.ErrnoException | null, address: string, family: number) => void)(null, first.address, first.family);
           }
         },
@@ -170,6 +181,14 @@ export function buildSignedCallbackUrl(database: AppDatabase, order: OrderRecord
 
 export function buildSignedReturnUrl(database: AppDatabase, order: OrderRecord) {
   if (!order.return_url || (order.status !== "paid" && order.status !== "late_paid")) return null;
+  try {
+    const parsed = new URL(order.return_url);
+    if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
   return buildSignedCallbackUrl(database, order, order.return_url);
 }
 

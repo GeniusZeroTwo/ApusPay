@@ -219,11 +219,19 @@ export function centsToMoney(cents: number) {
   return (cents / 100).toFixed(2);
 }
 
+/** Parse an untrusted integer query/form parameter safely within [min, max]. */
+export function parseBoundedInt(raw: string | undefined, fallback: number, min: number, max: number) {
+  if (raw === undefined || raw === "") return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(parsed)));
+}
+
 export function isAllowedCallbackHost(hostname: string, allowedHosts?: string[]): boolean {
-  const host = hostname.toLowerCase();
-  const configured = allowedHosts ?? (process.env.ALLOWED_CALLBACK_HOSTS ?? "")
-    .split(",")
-    .map((h) => h.trim().toLowerCase())
+  const host = hostname.toLowerCase().replace(/\.+$/, "");
+  const source = allowedHosts ?? (process.env.ALLOWED_CALLBACK_HOSTS ?? "").split(",");
+  const configured = source
+    .map((h) => h.trim().toLowerCase().replace(/\.+$/, ""))
     .filter(Boolean);
   return configured.some((allowed) => host === allowed || host.endsWith(`.${allowed}`));
 }
@@ -262,8 +270,15 @@ export function validateCallbackUrl(value: string, allowPrivate: boolean, allowe
 }
 
 function isPrivateHostname(hostname: string) {
-  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (normalized === "localhost" || normalized.endsWith(".localhost") || normalized.endsWith(".local")) return true;
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.+$/, "");
+  if (
+    normalized === "localhost" ||
+    normalized.endsWith(".localhost") ||
+    normalized.endsWith(".local") ||
+    normalized.endsWith(".internal")
+  ) {
+    return true;
+  }
   return isIP(normalized) > 0 && isPrivateAddress(normalized);
 }
 
@@ -278,12 +293,30 @@ export function isPrivateAddress(address: string): boolean {
     if (!groups) return true;
     // Unspecified (::) or Loopback (::1)
     if (groups.every((group) => group === 0) || (groups.slice(0, 7).every((group) => group === 0) && groups[7] === 1)) return true;
-    // Unique local (fc00::/7), link-local (fe80::/10), multicast (ff00::/8)
-    if ((groups[0]! & 0xfe00) === 0xfc00 || (groups[0]! & 0xffc0) === 0xfe80 || (groups[0]! & 0xff00) === 0xff00) return true;
-    // Documentation (2001:db8::/32) and Teredo (2001:0000::/32)
-    if (groups[0] === 0x2001 && (groups[1] === 0x0db8 || groups[1] === 0x0000)) return true;
+    // Unique local (fc00::/7), link-local (fe80::/10), legacy site-local (fec0::/10), multicast (ff00::/8)
+    if (
+      (groups[0]! & 0xfe00) === 0xfc00 ||
+      (groups[0]! & 0xffc0) === 0xfe80 ||
+      (groups[0]! & 0xffc0) === 0xfec0 ||
+      (groups[0]! & 0xff00) === 0xff00
+    ) {
+      return true;
+    }
+    // Discard-Only (100::/64)
+    if (groups[0] === 0x0100 && groups[1] === 0 && groups[2] === 0 && groups[3] === 0) return true;
+    // Documentation (2001:db8::/32), Teredo (2001:0000::/32), Benchmarking (2001:2::/48)
+    if (
+      groups[0] === 0x2001 &&
+      (groups[1] === 0x0db8 || groups[1] === 0x0000 || (groups[1] === 0x0002 && groups[2] === 0x0000))
+    ) {
+      return true;
+    }
     // IPv4-mapped (::ffff:a.b.c.d) or IPv4-compatible (::a.b.c.d)
     if (groups.slice(0, 5).every((group) => group === 0) && (groups[5] === 0xffff || groups[5] === 0x0000)) {
+      return isPrivateAddress(ipv4FromGroups(groups[6]!, groups[7]!));
+    }
+    // IPv4-translated (::ffff:0:a.b.c.d, RFC 2765)
+    if (groups.slice(0, 4).every((group) => group === 0) && groups[4] === 0xffff && groups[5] === 0x0000) {
       return isPrivateAddress(ipv4FromGroups(groups[6]!, groups[7]!));
     }
     // NAT64 Well-Known Prefix (64:ff9b::/96) and Local-Use NAT64 (64:ff9b:1::/48)

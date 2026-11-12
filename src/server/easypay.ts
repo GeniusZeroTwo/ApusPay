@@ -16,14 +16,20 @@ import {
   serializeOrder,
 } from "./orders";
 import { signPlatformParameters } from "./notifications";
-import { centsToMoney, parseMoneyToCents, rsaVerify, secureEqual, verifyMd5 } from "./security";
+import { centsToMoney, parseBoundedInt, parseMoneyToCents, rsaVerify, secureEqual, verifyMd5 } from "./security";
 import { WeChatPayService } from "./wechat";
 
 type Parameters = Record<string, string>;
 
+const UNSAFE_PARAM_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
 async function requestParameters(c: Context): Promise<Parameters> {
   const query = c.req.query();
-  if (c.req.method === "GET") return query;
+  const result: Parameters = {};
+  for (const [key, value] of Object.entries(query)) {
+    if (!UNSAFE_PARAM_KEYS.has(key) && typeof value === "string") result[key] = value;
+  }
+  if (c.req.method === "GET") return result;
   const contentType = c.req.header("content-type") ?? "";
   let body: Record<string, unknown> = {};
   if (contentType.includes("application/json")) {
@@ -31,9 +37,10 @@ async function requestParameters(c: Context): Promise<Parameters> {
   } else {
     body = await c.req.parseBody({ all: false }).catch(() => ({}));
   }
-  const result: Parameters = { ...query };
-  for (const [key, value] of Object.entries(body)) {
-    if (typeof value === "string") result[key] = value;
+  if (body && typeof body === "object") {
+    for (const [key, value] of Object.entries(body)) {
+      if (!UNSAFE_PARAM_KEYS.has(key) && typeof value === "string") result[key] = value;
+    }
   }
   return result;
 }
@@ -272,8 +279,8 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
         return c.json({ code: 1, msg: "查询订单号成功！", ...serializeOrder(order) });
       }
       if (act === "orders") {
-        const limit = Math.min(50, Math.max(1, Number(parameters.limit || 20)));
-        const page = Math.max(1, Number(parameters.page || 1));
+        const limit = parseBoundedInt(parameters.limit, 20, 1, 50);
+        const page = parseBoundedInt(parameters.page, 1, 1, 1_000_000);
         const result = listOrders(database, { limit, offset: (page - 1) * limit });
         return c.json({ code: 1, msg: "查询订单列表成功！", data: result.data.map(serializeOrder) });
       }
@@ -377,8 +384,8 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
     try {
       const parameters = await requestParameters(c);
       verifyV2(database, parameters);
-      const limit = Math.min(50, Math.max(1, Number(parameters.limit || 50)));
-      const offset = Math.max(0, Number(parameters.offset || 0));
+      const limit = parseBoundedInt(parameters.limit, 50, 1, 50);
+      const offset = parseBoundedInt(parameters.offset, 0, 0, 10_000_000);
       const result = listOrders(database, { limit, offset });
       return c.json(signedV2(database, { code: 0, msg: "success", data: result.data.map(serializeOrder) }));
     } catch (error) {
@@ -410,6 +417,10 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
         const outTradeNo = String(decrypted.out_trade_no ?? "");
         const tradeState = String(decrypted.trade_state ?? "");
         if (tradeState === "SUCCESS" && outTradeNo) {
+          const transactionId = String(decrypted.transaction_id ?? "").trim();
+          if (!transactionId) {
+            return c.json({ code: "FAIL", message: "缺少微信交易单号" }, 400);
+          }
           const order = database.query(
             "SELECT * FROM orders WHERE type = 'wxpay' AND collection_mode = 'wxpay_native' AND trade_no = ?",
           ).get(outTradeNo) as OrderRecord | null;
@@ -418,9 +429,15 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
             if (!Number.isInteger(paidCents) || paidCents !== order.payable_amount_cents) {
               return c.json({ code: "FAIL", message: "支付金额不匹配" }, 400);
             }
+            const existingByTx = database.query(
+              "SELECT id FROM orders WHERE type = 'wxpay' AND wxpay_transaction_id = ?",
+            ).get(transactionId) as { id: string } | null;
+            if (existingByTx && existingByTx.id !== order.id) {
+              return c.json({ code: "FAIL", message: "微信交易单号已关联其他订单" }, 409);
+            }
             markOrderPaidDirectly(database, order.id, {
               channel: "wxpay",
-              channelOrderId: String(decrypted.transaction_id ?? ""),
+              channelOrderId: transactionId,
               buyer: String((decrypted.payer as Record<string, unknown>)?.openid ?? ""),
               occurredAt: String(decrypted.success_time ?? new Date().toISOString()),
             });
@@ -495,11 +512,14 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
       checkLoginRateLimit(rateKey);
 
       const body = ((await c.req.json().catch(() => ({}))) ?? {}) as Record<string, unknown>;
-      const type = String(body.type ?? "wechat").toLowerCase().slice(0, 32);
+      const type = String(body.type ?? "wechat").toLowerCase().trim().slice(0, 32);
       const money = String(body.money ?? "").trim().slice(0, 32);
-      const queryToken = c.req.query("token") ?? "";
-      const headerToken = c.req.header("x-hook-token") ?? c.req.header("authorization")?.replace(/^Bearer\s+/i, "") ?? "";
-      const token = String(body.token ?? (queryToken || headerToken)).trim();
+      const queryToken = c.req.query("token")?.trim() ?? "";
+      const headerToken = (c.req.header("x-hook-token") ?? c.req.header("authorization")?.replace(/^Bearer\s+/i, "") ?? "").trim();
+      const bodyToken = typeof body.token === "string" ? body.token.trim() : "";
+      const suppliedTokens = [headerToken, queryToken, bodyToken].filter(Boolean);
+      const hasTokenConflict = new Set(suppliedTokens).size > 1;
+      const token = suppliedTokens[0] ?? "";
       const ua = (c.req.header("user-agent") || "unknown").slice(0, 160);
 
       console.info(JSON.stringify({
@@ -517,15 +537,18 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
         console.error(JSON.stringify({ level: "error", event: "hook_unconfigured", ip }));
         return c.json({ code: -1, msg: "hook token not configured" }, 503);
       }
-      if (!checkHookTokenMatch(token, expectedToken)) {
+      if (hasTokenConflict || !checkHookTokenMatch(token, expectedToken)) {
         recordLoginFailure(rateKey);
-        console.warn(JSON.stringify({ level: "warn", event: "hook_auth_failed", ip }));
-        return c.json({ code: -1, msg: "invalid hook token" }, 401);
+        console.warn(JSON.stringify({ level: "warn", event: "hook_auth_failed", ip, conflict: hasTokenConflict }));
+        return c.json({ code: -1, msg: hasTokenConflict ? "conflicting hook tokens" : "invalid hook token" }, 401);
       }
       clearLoginFailures(rateKey);
 
       if (!money) {
         return c.json({ code: -1, msg: "missing money" }, 400);
+      }
+      if (type !== "wechat" && type !== "wxpay" && type !== "alipay") {
+        return c.json({ code: -1, msg: "unsupported hook channel type" }, 400);
       }
 
       const cleanMoney = money.replace(/^[￥¥\$\s]+/, "").trim();

@@ -5,8 +5,10 @@ import {
   encryptSecret,
   generateRsaKeyPair,
   generateRsaKeyPairAsync,
+  isAllowedCallbackHost,
   isPrivateAddress,
   md5Sign,
+  parseBoundedInt,
   parseMoneyToCents,
   resolvePublicDestination,
   rsaSign,
@@ -90,6 +92,10 @@ describe("secret and input security", () => {
       "2002:c0a8:0101::",
       "2001:0000:4136:e378:8000:63bf:3fff:fdd2",
       "2001:db8::1",
+      "100::1",
+      "2001:2::1",
+      "fec0::1",
+      "::ffff:0:127.0.0.1",
     ]) {
       expect(isPrivateAddress(ip)).toBe(true);
     }
@@ -97,8 +103,17 @@ describe("secret and input security", () => {
     expect(isPrivateAddress("64:ff9b::8.8.8.8")).toBe(false);
     expect(isPrivateAddress("2002:0808:0808::")).toBe(false);
     expect(() => validateCallbackUrl("http://localhost/callback", false)).toThrow();
+    expect(() => validateCallbackUrl("http://localhost./callback", false)).toThrow();
+    expect(() => validateCallbackUrl("http://sub.localhost./callback", false)).toThrow();
+    expect(() => validateCallbackUrl("http://metadata.internal./callback", false)).toThrow();
     expect(() => validateCallbackUrl("http://[::127.0.0.1]/callback", false)).toThrow();
+    expect(() => validateCallbackUrl("http://[::ffff:0:127.0.0.1]/callback", false)).toThrow();
     expect(() => validateCallbackUrl("http://[64:ff9b::169.254.169.254]/callback", false)).toThrow();
+    expect(isAllowedCallbackHost("sub.example.com.", ["example.com."])).toBe(true);
+    expect(parseBoundedInt(undefined, 20, 1, 50)).toBe(20);
+    expect(parseBoundedInt("abc", 20, 1, 50)).toBe(20);
+    expect(parseBoundedInt("-5", 20, 1, 50)).toBe(1);
+    expect(parseBoundedInt("999", 20, 1, 50)).toBe(50);
     expect(() => validateCallbackUrl("file:///etc/passwd", false)).toThrow();
     expect(() => validateCallbackUrl("http://example.com:22/callback", false)).toThrow();
     expect(() => validateCallbackUrl("http://example.com:6379/callback", false)).toThrow();

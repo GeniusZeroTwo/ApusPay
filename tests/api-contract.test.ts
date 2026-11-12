@@ -301,5 +301,34 @@ describe("PC WeChat Hook contract", () => {
       body: hugeBody,
     });
     expect(tooLarge.status).toBe(413);
+
+    // 4. Empty body.token must not shadow X-Hook-Token header; conflicting tokens fail with 401; invalid type fails with 400
+    const headerWithEmptyBodyToken = await app.request("http://localhost/api/hook/receive", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-hook-token": "test-secret-token" },
+      body: JSON.stringify({ type: "wechat", money: "9.99", token: "" }),
+    });
+    expect(headerWithEmptyBodyToken.status).toBe(200);
+
+    const conflictingTokens = await app.request("http://localhost/api/hook/receive", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-hook-token": "test-secret-token" },
+      body: JSON.stringify({ type: "wechat", money: "9.99", token: "other-token" }),
+    });
+    expect(conflictingTokens.status).toBe(401);
+
+    const invalidType = await app.request("http://localhost/api/hook/receive", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-hook-token": "test-secret-token" },
+      body: JSON.stringify({ type: "unknown_channel", money: "9.99" }),
+    });
+    expect(invalidType.status).toBe(400);
+
+    // 5. Non-finite pagination falls back safely instead of throwing SQLite errors
+    const ordersRes = await app.request(
+      "http://localhost/api.php?act=orders&pid=1000000001&key=1234567890abcdef1234567890abcdef&page=abc&limit=NaN",
+    );
+    expect(ordersRes.status).toBe(200);
+    expect((await ordersRes.json() as { code: number }).code).toBe(1);
   });
 });
