@@ -10,11 +10,11 @@ import {
   WalletCards,
 } from "lucide-react";
 import QRCode from "qrcode";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import useSWR from "swr";
 import { PAYMENT_POLL_INTERVAL_DEFAULT_SECONDS, type CheckoutData } from "@/shared/contracts";
-import { swrFetcher } from "@/web/api";
+import { ApiClientError, swrFetcher } from "@/web/api";
 import { Badge } from "@/web/components/ui/badge";
 import { Button } from "@/web/components/ui/button";
 import { Card, CardContent } from "@/web/components/ui/card";
@@ -30,22 +30,31 @@ export function CheckoutPage() {
   const { token = "" } = useParams();
   const [now, setNow] = useState(Date.now());
   const [isChecking, setIsChecking] = useState(false);
-  const [redirectCountdown, setRedirectCountdown] = useState(2);
 
-  const { data, error, isLoading, mutate } = useSWR<CheckoutData>(
+  const resolveRefreshInterval = useCallback((latest?: CheckoutData) => {
+    if (latest && (["paid", "late_paid"].includes(latest.status) || Date.parse(latest.monitor_until) <= Date.now())) {
+      return 0;
+    }
+    const baseInterval = (latest?.payment_poll_interval_seconds ?? PAYMENT_POLL_INTERVAL_DEFAULT_SECONDS) * 1_000;
+    // 固定函数引用避免每秒倒计时重渲染重置 SWR 定时器，活跃等待期以 1 秒高频轮询
+    return Math.min(baseInterval, 1_000);
+  }, []);
+
+  const shouldRetryCheckout = useCallback((err: unknown) => {
+    return !(err instanceof ApiClientError && err.status === 404);
+  }, []);
+
+  const { data, isLoading, mutate } = useSWR<CheckoutData>(
     `/public-api/checkout/${encodeURIComponent(token)}`,
     swrFetcher,
     {
-      refreshInterval: (latest) => {
-        if (latest && (["paid", "late_paid"].includes(latest.status) || Date.parse(latest.monitor_until) <= Date.now())) return 0;
-        const baseInterval = (latest?.payment_poll_interval_seconds ?? PAYMENT_POLL_INTERVAL_DEFAULT_SECONDS) * 1_000;
-        // 活跃等待期间加快轮询频率到 1.5 秒，确保客户扫码支付后秒级感知并自动跳转
-        return Math.min(baseInterval, 1_500);
-      },
+      refreshInterval: resolveRefreshInterval,
+      dedupingInterval: 500,
       refreshWhenHidden: false,
       revalidateOnFocus: true,
       revalidateOnReconnect: true,
-      shouldRetryOnError: false,
+      shouldRetryOnError: shouldRetryCheckout,
+      errorRetryInterval: 1_000,
     },
   );
 
@@ -111,7 +120,7 @@ export function CheckoutPage() {
     let worker: Worker | null = null;
     let workerUrl = "";
     try {
-      const code = "setInterval(function() { postMessage('tick'); }, 2000);";
+      const code = "setInterval(function() { postMessage('tick'); }, 1500);";
       const blob = new Blob([code], { type: "application/javascript" });
       workerUrl = URL.createObjectURL(blob);
       worker = new Worker(workerUrl);
@@ -176,22 +185,14 @@ export function CheckoutPage() {
     };
   }, [isTerminal, mutate]);
 
-  // 5. 支付成功后自动跳转商户（包含倒计时与即时返回）
+  // 5. 支付成功后秒级自动跳回商户页面（仅短暂展示成功态 250ms 即刻跳转）
   useEffect(() => {
     if (!paid || !data?.return_target) return;
-    const interval = setInterval(() => {
-      setRedirectCountdown((prev) => {
-        if (prev <= 1) {
-          clearInterval(interval);
-          if (data.return_target && /^https?:\/\//i.test(data.return_target)) {
-            window.location.replace(data.return_target);
-          }
-          return 0;
-        }
-        return prev - 1;
-      });
-    }, 1000);
-    return () => clearInterval(interval);
+    if (!/^https?:\/\//i.test(data.return_target)) return;
+    const timer = window.setTimeout(() => {
+      window.location.replace(data.return_target!);
+    }, 250);
+    return () => window.clearTimeout(timer);
   }, [paid, data?.return_target]);
 
   const handleManualCheck = async () => {
@@ -204,7 +205,7 @@ export function CheckoutPage() {
   };
 
   if (isLoading) return <Loading label="正在读取支付订单" />;
-  if (error || !data) {
+  if (!data) {
     return (
       <main className="flex min-h-screen items-center justify-center px-4">
         <div className="max-w-sm text-center">
@@ -233,10 +234,10 @@ export function CheckoutPage() {
             {data.return_target ? (
               <div className="mt-6 space-y-3">
                 <p className="text-sm font-medium text-primary">
-                  {redirectCountdown > 0 ? `${redirectCountdown} 秒后自动返回商户页面...` : "正在跳转..."}
+                  正在自动返回商户页面...
                 </p>
                 <Button className="w-full" asChild>
-                  <a href={data.return_target} target="_blank" rel="noopener noreferrer">
+                  <a href={data.return_target}>
                     立即返回商户页面<ExternalLink className="size-4" />
                   </a>
                 </Button>
