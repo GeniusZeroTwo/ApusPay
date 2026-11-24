@@ -4,6 +4,7 @@ import {
   createTransferUri,
   createOrder,
   externalStatus,
+  formatApiDate,
   getActiveOrders,
   getCheckoutData,
   getOrderById,
@@ -189,5 +190,77 @@ describe("payment state machine", () => {
 
     const aliOrder2 = (await createOrder(database, { ...orderInput(3), money: "2.00" })).order;
     expect(aliOrder2.payable_amount_cents).toBe(200);
+
+    // 4. Historical bill log 30 seconds before order creation must NOT match (-5s skew limit)
+    const aliOrder3 = (await createOrder(database, { ...orderInput(4), money: "3.00" })).order;
+    const staleBill = recordAndMatchPayment(database, {
+      accountLogId: "STALE-LOG-30S",
+      occurredAt: new Date(Date.parse(aliOrder3.created_at) - 30_000).toISOString(),
+      direction: "收入",
+      amountCents: aliOrder3.payable_amount_cents,
+      alipayOrderNo: "ALI-STALE",
+      transMemo: "",
+      otherAccount: "offline-buyer",
+      raw: {},
+    });
+    expect(staleBill.matched).toBe(false);
+    expect(getOrderById(database, aliOrder3.id)?.status).toBe("pending");
+
+    // 5. wxpay_hook paid order retains cooldown so immediate next wxpay order gets +0.01, while Alipay channel pool is independent
+    expect(markOrderPaidDirectly(database, wxOrder.id, { channel: "wxpay", channelOrderId: "HOOK-1", buyer: "PC-Hook" })).toBe(true);
+    const wxOrderNext = (await createOrder(database, { ...orderInput(5), type: "wxpay", money: "1.00" })).order;
+    expect(wxOrderNext.payable_amount_cents).toBe(101);
+    const aliIndependent = (await createOrder(database, { ...orderInput(6), type: "alipay", money: "1.00" })).order;
+    expect(aliIndependent.payable_amount_cents).toBe(100);
+  });
+
+  it("coalesces concurrent F2F order creation, recovers null QR payloads, requires full wxpay_native keys, and guards invalid dates", async () => {
+    ({ database } = configuredDatabase("alipay_f2f"));
+    setSetting(database, "alipay_mode", "f2f");
+    let precreateCalls = 0;
+    let capturedTimeout: string | undefined;
+    const mockAlipay = {
+      precreateTrade: async (input: { outTradeNo: string; timeoutExpress?: string }) => {
+        precreateCalls += 1;
+        capturedTimeout = input.timeoutExpress;
+        await new Promise((r) => setTimeout(r, 40));
+        return { qrCode: `https://qr.alipay.com/mock-${input.outTradeNo}` };
+      },
+    } as never;
+
+    const [resA, resB] = await Promise.all([
+      createOrder(database, orderInput(10), { alipay: mockAlipay }),
+      createOrder(database, orderInput(10), { alipay: mockAlipay }),
+    ]);
+    expect(precreateCalls).toBe(1);
+    expect(capturedTimeout).toBe("6m");
+    expect(resA.order.id).toBe(resB.order.id);
+    expect(resA.order.channel_qr_payload).toStartWith("https://qr.alipay.com/mock-");
+    expect(resB.order.channel_qr_payload).toBe(resA.order.channel_qr_payload);
+
+    // Simulate crashed order with channel_qr_payload = NULL and verify retry self-heals
+    database.query("UPDATE orders SET channel_qr_payload = NULL WHERE id = ?").run(resA.order.id);
+    const recovered = await createOrder(database, orderInput(10), { alipay: mockAlipay });
+    expect(precreateCalls).toBe(2);
+    expect(recovered.order.channel_qr_payload).toStartWith("https://qr.alipay.com/mock-");
+
+    // Malformed occurredAt / paid_at never throws RangeError
+    expect(formatApiDate("not-a-valid-date")).toBe("");
+    expect(markOrderPaidDirectly(database, resA.order.id, { channel: "alipay", channelOrderId: "ALI-F2F-1", occurredAt: "garbage-date" })).toBe(true);
+    expect(formatApiDate(getOrderById(database, resA.order.id)?.paid_at ?? null)).not.toBe("");
+
+    // WeChat Native requires both 32-char APIv3 key and platform public key
+    const { setSecret, getPublicSettings } = await import("../src/server/config");
+    setSetting(database, "wxpay_mode", "native");
+    setSetting(database, "wxpay_app_id", "wx1234567890");
+    setSetting(database, "wxpay_mch_id", "1900000109");
+    setSetting(database, "wxpay_serial_no", "SERIAL12345");
+    setSecret(database, "wxpay_private_key", configuredDatabase().alipay.privateKey);
+    expect(getPublicSettings(database).wxpay_configured).toBe(false);
+    await expect(createOrder(database, { ...orderInput(11), type: "wxpay" })).rejects.toThrow(/APIv3|尚未配置完整/);
+
+    setSecret(database, "wxpay_api_v3_key", "0123456789abcdef0123456789abcdef");
+    setSetting(database, "wxpay_public_key", configuredDatabase().alipay.publicKey);
+    expect(getPublicSettings(database).wxpay_configured).toBe(true);
   });
 });

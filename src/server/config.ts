@@ -66,9 +66,21 @@ export function getPaymentPollIntervalSeconds(database: AppDatabase) {
     : PAYMENT_POLL_INTERVAL_DEFAULT_SECONDS;
 }
 
+export function clearSecretCache(database: AppDatabase) {
+  secretCache.delete(database);
+}
+
 export function getPublicSettings(database: AppDatabase): PublicSettings {
   const v1Key = getSecret(database, "v1_key");
-  const alipayMode = getSetting<AlipayMode>(database, "alipay_mode", "f2f");
+  const configuredCollection = getSetting<string>(database, "collection_mode", "");
+  let alipayMode = getSetting<AlipayMode>(database, "alipay_mode", "f2f");
+  if (configuredCollection === "transfer" || configuredCollection === "alipay_transfer") {
+    alipayMode = "transfer";
+  } else if (configuredCollection === "business_qr" || configuredCollection === "alipay_bill") {
+    alipayMode = "bill";
+  } else if (configuredCollection === "alipay_f2f") {
+    alipayMode = "f2f";
+  }
   const wxpayMode = getSetting<WxpayMode>(database, "wxpay_mode", "native");
 
   const alipayConfigured = Boolean(
@@ -77,13 +89,16 @@ export function getPublicSettings(database: AppDatabase): PublicSettings {
     getSetting(database, "alipay_public_key", ""),
   );
 
+  const wxpayApiV3Key = getSecret(database, "wxpay_api_v3_key");
   const wxpayConfigured = wxpayMode === "hook"
     ? Boolean(getSetting(database, "wxpay_static_qr_url", "") && getSecret(database, "wxpay_hook_token"))
     : Boolean(
         getSetting(database, "wxpay_app_id", "") &&
         getSetting(database, "wxpay_mch_id", "") &&
         getSetting(database, "wxpay_serial_no", "") &&
-        getSecret(database, "wxpay_private_key"),
+        getSecret(database, "wxpay_private_key") &&
+        wxpayApiV3Key.length === 32 &&
+        getSetting(database, "wxpay_public_key", ""),
       );
 
   return {

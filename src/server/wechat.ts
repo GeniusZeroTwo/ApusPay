@@ -21,16 +21,25 @@ export interface WeChatQueryResult {
 export class WeChatPayService {
   constructor(private readonly database: AppDatabase) {}
 
-  public getCredentials() {
+  public getCredentials(options?: { requireCallbackKeys?: boolean }) {
     const appId = getSetting(this.database, "wxpay_app_id", "");
     const mchId = getSetting(this.database, "wxpay_mch_id", "");
     const serialNo = getSetting(this.database, "wxpay_serial_no", "");
     const privateKey = getSecret(this.database, "wxpay_private_key");
     const apiV3Key = getSecret(this.database, "wxpay_api_v3_key");
+    const publicKey = getSetting(this.database, "wxpay_public_key", "").trim();
     if (!appId || !mchId || !serialNo || !privateKey) {
       throw new AppError(503, "WXPAY_NOT_CONFIGURED", "微信支付 AppID、商户号、证书序列号或商户私钥尚未配置完整");
     }
-    return { appId, mchId, serialNo, privateKey, apiV3Key };
+    if (options?.requireCallbackKeys) {
+      if (!apiV3Key || apiV3Key.length !== 32) {
+        throw new AppError(503, "WXPAY_API_V3_KEY_MISSING", "微信支付 APIv3 密钥尚未配置或长度不为 32 位");
+      }
+      if (!publicKey) {
+        throw new AppError(503, "WXPAY_PUBLIC_KEY_MISSING", "微信支付平台公钥/证书尚未配置");
+      }
+    }
+    return { appId, mchId, serialNo, privateKey, apiV3Key, publicKey };
   }
 
   private buildAuthorization(method: string, urlPath: string, body = ""): string {
@@ -51,8 +60,9 @@ export class WeChatPayService {
     totalCents: number;
     description: string;
     notifyUrl?: string;
+    timeExpire?: string;
   }): Promise<WeChatPrepayResult> {
-    const { appId, mchId } = this.getCredentials();
+    const { appId, mchId } = this.getCredentials({ requireCallbackKeys: true });
     const path = "/v3/pay/transactions/native";
     const publicUrl = getSetting(this.database, "public_base_url", "http://localhost");
     const bodyObj = {
@@ -61,6 +71,7 @@ export class WeChatPayService {
       description: input.description.slice(0, 120),
       out_trade_no: input.outTradeNo,
       notify_url: input.notifyUrl || `${publicUrl.replace(/\/$/, "")}/api/pay/wechat/notify`,
+      ...(input.timeExpire ? { time_expire: input.timeExpire } : {}),
       amount: {
         total: input.totalCents,
         currency: "CNY",
@@ -113,7 +124,12 @@ export class WeChatPayService {
       throw new AppError(502, "WXPAY_QUERY_FAILED", String(resJson.message ?? "微信订单查询失败"));
     }
 
-    const rawTotal = (resJson.amount as Record<string, unknown> | undefined)?.total;
+    const amountObj = resJson.amount as Record<string, unknown> | undefined;
+    const currency = amountObj?.currency;
+    if (currency !== undefined && currency !== "CNY") {
+      throw new AppError(400, "WXPAY_CURRENCY_MISMATCH", "微信订单币种不匹配");
+    }
+    const rawTotal = amountObj?.total;
     const amountCents = typeof rawTotal === "number" && Number.isInteger(rawTotal) ? rawTotal : undefined;
 
     return {
@@ -134,8 +150,13 @@ export class WeChatPayService {
     const timestamp = headers.get("wechatpay-timestamp")?.trim() ?? "";
     const nonce = headers.get("wechatpay-nonce")?.trim() ?? "";
     const signature = headers.get("wechatpay-signature")?.trim() ?? "";
+    const serial = headers.get("wechatpay-serial")?.trim() ?? "";
     if (!timestamp || !nonce || !signature) {
       throw new AppError(401, "WXPAY_SIGNATURE_MISSING", "缺少微信支付回调签名头");
+    }
+    const expectedPlatformSerial = getSetting(this.database, "wxpay_platform_serial", "").trim();
+    if (expectedPlatformSerial && serial !== expectedPlatformSerial) {
+      throw new AppError(401, "WXPAY_SERIAL_MISMATCH", "微信回调平台证书/公钥序列号不匹配");
     }
     if (!/^\d{10}$/.test(timestamp) || Math.abs(Math.floor(Date.now() / 1000) - Number(timestamp)) > 300) {
       throw new AppError(401, "WXPAY_TIMESTAMP_EXPIRED", "微信回调时间戳无效或已过期");

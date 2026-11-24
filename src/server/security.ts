@@ -342,7 +342,7 @@ export function isPrivateAddress(address: string): boolean {
     (a === 198 && b === 51 && c === 100) || (a === 203 && b === 0 && c === 113);
 }
 
-function expandIpv6(address: string) {
+export function expandIpv6(address: string) {
   let normalized = address;
   const dotted = normalized.match(/(\d+\.\d+\.\d+\.\d+)$/)?.[1];
   if (dotted) {
@@ -381,6 +381,56 @@ export async function resolvePublicDestination(
     throw new AppError(400, "PRIVATE_CALLBACK_FORBIDDEN", "回调域名解析到了私有或保留地址");
   }
   return results;
+}
+
+export function ipMatchesCidr(rawIp: string, rawRule: string): boolean {
+  const ip = rawIp.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  const rule = rawRule.trim().toLowerCase();
+  if (!ip || !rule) return false;
+  const slashIdx = rule.indexOf("/");
+  if (slashIdx === -1) {
+    return ip === rule.replace(/^\[|\]$/g, "");
+  }
+  const base = rule.slice(0, slashIdx).replace(/^\[|\]$/g, "");
+  const prefix = Number.parseInt(rule.slice(slashIdx + 1), 10);
+  if (!Number.isInteger(prefix)) return false;
+
+  if (base.includes(":")) {
+    if (prefix < 0 || prefix > 128) return false;
+    const ipGroups = ip.includes(":") ? expandIpv6(ip) : expandIpv6(`::ffff:${ip}`);
+    const baseGroups = expandIpv6(base);
+    if (!ipGroups || !baseGroups) return false;
+    let remaining = prefix;
+    for (let i = 0; i < 8 && remaining > 0; i += 1) {
+      const bits = Math.min(16, remaining);
+      const mask = bits === 16 ? 0xffff : ((0xffff << (16 - bits)) & 0xffff);
+      if ((ipGroups[i]! & mask) !== (baseGroups[i]! & mask)) return false;
+      remaining -= bits;
+    }
+    return true;
+  }
+
+  if (prefix < 0 || prefix > 32) return false;
+  let ipv4 = ip;
+  if (ip.startsWith("::ffff:") && !ip.slice(7).includes(":")) {
+    ipv4 = ip.slice(7);
+  } else if (ip.includes(":")) {
+    return false;
+  }
+  const ipParts = ipv4.split(".").map(Number);
+  const baseParts = base.split(".").map(Number);
+  if (
+    ipParts.length !== 4 ||
+    baseParts.length !== 4 ||
+    ipParts.some((n) => !Number.isInteger(n) || n < 0 || n > 255) ||
+    baseParts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)
+  ) {
+    return false;
+  }
+  const ipInt = (((ipParts[0]! << 24) | (ipParts[1]! << 16) | (ipParts[2]! << 8) | ipParts[3]!) >>> 0);
+  const baseInt = (((baseParts[0]! << 24) | (baseParts[1]! << 16) | (baseParts[2]! << 8) | baseParts[3]!) >>> 0);
+  const mask = prefix === 0 ? 0 : ((0xffffffff << (32 - prefix)) >>> 0);
+  return (ipInt & mask) === (baseInt & mask);
 }
 
 export async function assertPublicDestination(url: URL, allowPrivate: boolean, allowedHosts?: string[]) {

@@ -110,4 +110,45 @@ describe("shared payment scanner", () => {
     await scanner.ensureFresh(order);
     expect(tradeQueries).toBe(1);
   });
+
+  it("performs final check and calls closeTrade once after monitor_until for direct F2F orders", async () => {
+    ({ database } = configuredDatabase("alipay_f2f"));
+    setSetting(database, "alipay_mode", "f2f");
+    const order = (await createOrder(database, orderInput(20))).order;
+    database.query("UPDATE orders SET expires_at = ?, monitor_until = ? WHERE id = ?").run(
+      new Date(Date.now() - 6 * 60_000).toISOString(),
+      new Date(Date.now() - 1_000).toISOString(),
+      order.id,
+    );
+
+    let queryCalls = 0;
+    const closedTrades: string[] = [];
+    const f2fProvider: AccountLogProvider = {
+      async query(input) {
+        return { pageNo: input.pageNo, pageSize: input.pageSize, totalSize: 0, traceId: "t", details: [] };
+      },
+      async queryTrade() {
+        queryCalls += 1;
+        return { success: false };
+      },
+      async closeTrade(outTradeNo) {
+        closedTrades.push(outTradeNo);
+      },
+    };
+
+    const scanner = new PaymentScanner(database, f2fProvider);
+    const firstScan = await scanner.scanNow();
+    expect(firstScan.status).toBe("success");
+    expect(queryCalls).toBe(1);
+    expect(closedTrades).toEqual([order.trade_no]);
+    const updated = getOrderById(database, order.id);
+    expect(updated?.status).toBe("expired");
+    expect(updated?.upstream_closed_at).toBeTruthy();
+
+    // Subsequent scans skip already-closed expired orders
+    const secondScan = await scanner.scanNow();
+    expect(secondScan.status).toBe("skipped");
+    expect(queryCalls).toBe(1);
+    expect(closedTrades.length).toBe(1);
+  });
 });

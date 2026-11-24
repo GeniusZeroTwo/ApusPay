@@ -17,8 +17,8 @@ export interface AccountLogPage {
 
 export interface AccountLogProvider {
   query(input: { startTime: string; endTime: string; pageNo: number; pageSize: number }): Promise<AccountLogPage>;
-  precreateTrade?(input: { outTradeNo: string; totalAmount: string; subject: string }): Promise<{ qrCode: string }>;
-  queryTrade?(outTradeNo: string): Promise<{ success: boolean; tradeNo?: string; buyerId?: string; tradeStatus?: string; amountCents?: number }>;
+  precreateTrade?(input: { outTradeNo: string; totalAmount: string; subject: string; timeoutExpress?: string; timeExpire?: string }): Promise<{ qrCode: string }>;
+  queryTrade?(outTradeNo: string): Promise<{ success: boolean; tradeNo?: string; buyerId?: string; tradeStatus?: string; amountCents?: number; paidAt?: string }>;
   closeTrade?(outTradeNo: string): Promise<void>;
 }
 
@@ -43,7 +43,7 @@ export class OfficialAlipayProvider implements AccountLogProvider {
       throw new AppError(503, "ALIPAY_NOT_CONFIGURED", "支付宝应用 ID、应用私钥或支付宝公钥尚未配置完整");
     }
 
-    const endpoint = getSetting(this.database, "alipay_endpoint", "https://openapi.alipay.com");
+    const endpoint = getSetting(this.database, "alipay_endpoint", "https://openapi.alipay.com").replace(/\/$/, "");
     const cacheKey = `${appId}\n${endpoint}\n${privateKey}\n${alipayPublicKey}`;
     if (this.cachedSdk?.key === cacheKey) {
       return this.cachedSdk.sdk;
@@ -56,6 +56,7 @@ export class OfficialAlipayProvider implements AccountLogProvider {
       signType: "RSA2",
       keyType: "PKCS8",
       endpoint,
+      gateway: `${endpoint}/gateway.do`,
       timeout: 8_000,
       camelcase: false,
     });
@@ -89,15 +90,17 @@ export class OfficialAlipayProvider implements AccountLogProvider {
     };
   }
 
-  async precreateTrade(input: { outTradeNo: string; totalAmount: string; subject: string }): Promise<{ qrCode: string }> {
+  async precreateTrade(input: { outTradeNo: string; totalAmount: string; subject: string; timeoutExpress?: string; timeExpire?: string }): Promise<{ qrCode: string }> {
     const sdk = this.getSdk();
     const result = (await sdk.exec("alipay.trade.precreate", {
       bizContent: {
         out_trade_no: input.outTradeNo,
         total_amount: input.totalAmount,
         subject: input.subject.slice(0, 120),
+        timeout_express: input.timeoutExpress ?? "6m",
+        ...(input.timeExpire ? { time_expire: input.timeExpire } : {}),
       },
-    })) as Record<string, unknown>;
+    }, { validateSign: true })) as Record<string, unknown>;
     const qrCode = (result.qr_code ?? result.qrCode ?? "") as string;
     if (!qrCode) {
       throw new AppError(502, "ALIPAY_PRECREATE_FAILED", String(result.sub_msg ?? result.msg ?? "支付宝当面付下单失败"));
@@ -105,12 +108,12 @@ export class OfficialAlipayProvider implements AccountLogProvider {
     return { qrCode };
   }
 
-  async queryTrade(outTradeNo: string): Promise<{ success: boolean; tradeNo?: string; buyerId?: string; tradeStatus?: string; amountCents?: number }> {
+  async queryTrade(outTradeNo: string): Promise<{ success: boolean; tradeNo?: string; buyerId?: string; tradeStatus?: string; amountCents?: number; paidAt?: string }> {
     const sdk = this.getSdk();
     try {
       const result = (await sdk.exec("alipay.trade.query", {
         bizContent: { out_trade_no: outTradeNo },
-      })) as Record<string, unknown>;
+      }, { validateSign: true })) as Record<string, unknown>;
       const tradeStatus = (result.trade_status ?? result.tradeStatus ?? "") as string;
       const tradeNo = (result.trade_no ?? result.tradeNo ?? "") as string;
       const buyerId = (result.buyer_user_id ?? result.buyerUserId ?? result.buyer_logon_id ?? "") as string;
@@ -118,9 +121,15 @@ export class OfficialAlipayProvider implements AccountLogProvider {
       const amountCents = rawTotal !== undefined && rawTotal !== null && String(rawTotal).trim() !== ""
         ? parseMoneyToCents(String(rawTotal))
         : undefined;
+      const rawPayDate = String(result.send_pay_date ?? result.sendPayDate ?? "").trim();
+      const paidAt = rawPayDate ? parseAlipayTime(rawPayDate) : undefined;
       const success = (tradeStatus === "TRADE_SUCCESS" || tradeStatus === "TRADE_FINISHED") && amountCents !== undefined;
-      return { success, tradeNo, buyerId, tradeStatus, amountCents };
-    } catch {
+      return { success, tradeNo, buyerId, tradeStatus, amountCents, paidAt };
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (error instanceof Error && (error.name === "AlipayResponseSignError" || /sign|验签/i.test(msg))) {
+        throw new AppError(502, "ALIPAY_INVALID_RESPONSE_SIGN", `支付宝响应验签失败: ${msg}`);
+      }
       return { success: false };
     }
   }
@@ -129,7 +138,7 @@ export class OfficialAlipayProvider implements AccountLogProvider {
     const sdk = this.getSdk();
     await sdk.exec("alipay.trade.close", {
       bizContent: { out_trade_no: outTradeNo },
-    }).catch(() => undefined);
+    }, { validateSign: true }).catch(() => undefined);
   }
 }
 
@@ -220,11 +229,24 @@ export class PaymentScanner {
     return this.lastCompletedAt;
   }
 
+  private getUnclosedExpiredDirectOrders(now = new Date().toISOString()): OrderRecord[] {
+    return this.database.query(`
+      SELECT * FROM orders
+      WHERE collection_mode IN ('alipay_f2f', 'wxpay_native')
+        AND status IN ('pending', 'expired')
+        AND monitor_until <= ?
+        AND upstream_closed_at IS NULL
+      ORDER BY created_at ASC
+      LIMIT 20
+    `).all(now) as OrderRecord[];
+  }
+
   start() {
     if (this.timer) return;
     this.timer = setInterval(() => {
       const pollIntervalMs = getPaymentPollIntervalSeconds(this.database) * 1_000;
-      if (getActiveOrders(this.database).length > 0 && Date.now() - this.lastCompletedAt >= pollIntervalMs) {
+      const hasWork = getActiveOrders(this.database).length > 0 || this.getUnclosedExpiredDirectOrders().length > 0;
+      if (hasWork && Date.now() - this.lastCompletedAt >= pollIntervalMs) {
         void this.scanNow("scheduler").catch((error) => {
           console.error(JSON.stringify({ level: "error", event: "scan_failed", message: error instanceof Error ? error.message : String(error) }));
         });
@@ -250,20 +272,28 @@ export class PaymentScanner {
               channel: "alipay",
               channelOrderId: query.tradeNo,
               buyer: query.buyerId,
+              occurredAt: query.paidAt,
             });
           }
         } else if (order.collection_mode === "wxpay_native") {
           const query = await this.wechat.queryOrder(order.trade_no);
-          if (query.tradeState === "SUCCESS" && query.amountCents === order.payable_amount_cents) {
+          if (query.tradeState === "SUCCESS" && query.amountCents === order.payable_amount_cents && query.transactionId) {
             return markOrderPaidDirectly(this.database, order.id, {
               channel: "wxpay",
               channelOrderId: query.transactionId,
               buyer: query.payerOpenid,
+              occurredAt: query.successTime,
             });
           }
         }
         return false;
-      } catch {
+      } catch (error) {
+        console.warn(JSON.stringify({
+          level: "warn",
+          event: "direct_order_check_failed",
+          trade_no: order.trade_no,
+          message: error instanceof Error ? error.message : String(error),
+        }));
         return false;
       } finally {
         if (this.orderLastCheckedAt.size > 1_024) {
@@ -277,6 +307,42 @@ export class PaymentScanner {
 
     this.orderCheckInFlight.set(order.id, task);
     return task;
+  }
+
+  /** Force-sync a single order on admin request, even after monitor_until has passed. */
+  async syncOrder(order: OrderRecord): Promise<boolean> {
+    if (order.status === "paid" || order.status === "late_paid") return false;
+    if (order.collection_mode === "alipay_f2f" || order.collection_mode === "wxpay_native") {
+      return await this.checkDirectOrder(order);
+    }
+    await this.scanNow("manual_order_sync");
+    const updated = this.database.query("SELECT status FROM orders WHERE id = ?").get(order.id) as { status: string } | null;
+    return updated?.status === "paid" || updated?.status === "late_paid";
+  }
+
+  private async closeExpiredDirectOrders(nowIso: string): Promise<number> {
+    const expiredDirect = this.getUnclosedExpiredDirectOrders(nowIso);
+    if (expiredDirect.length === 0) return 0;
+    let lateMatched = 0;
+    await runWithConcurrency(expiredDirect, 5, async (order) => {
+      const paid = await this.checkDirectOrder(order);
+      if (paid) {
+        lateMatched += 1;
+        return;
+      }
+      if (order.collection_mode === "alipay_f2f") {
+        await this.provider.closeTrade?.(order.trade_no);
+      } else if (order.collection_mode === "wxpay_native") {
+        await this.wechat.closeOrder(order.trade_no).catch(() => undefined);
+      }
+      this.database.query(`
+        UPDATE orders
+        SET status = CASE WHEN status = 'pending' THEN 'expired' ELSE status END,
+            upstream_closed_at = ?
+        WHERE id = ? AND status IN ('pending', 'expired')
+      `).run(nowIso, order.id);
+    });
+    return lateMatched;
   }
 
   async ensureFresh(order: OrderRecord) {
@@ -324,13 +390,14 @@ export class PaymentScanner {
 
   private async performScan(reason: string): Promise<ScanResult> {
     this.maybePruneHistoricalRows();
-    let candidates = getActiveOrders(this.database);
     const startedAt = new Date().toISOString();
+    const unclosedDirectCount = this.getUnclosedExpiredDirectOrders(startedAt).length;
+    let candidates = getActiveOrders(this.database);
     const run = this.database.query(`
       INSERT INTO scan_runs(started_at, status, active_orders) VALUES (?, 'running', ?) RETURNING id
     `).get(startedAt, candidates.length) as { id: number };
 
-    if (candidates.length === 0) {
+    if (candidates.length === 0 && unclosedDirectCount === 0) {
       const finishedAt = new Date().toISOString();
       this.database.query("UPDATE scan_runs SET status = 'skipped', finished_at = ? WHERE id = ?").run(finishedAt, run.id);
       return { status: "skipped", activeOrders: 0, pages: 0, records: 0, matched: 0, traceId: "" };
@@ -338,7 +405,7 @@ export class PaymentScanner {
 
     let pages = 0;
     let records = 0;
-    let matched = 0;
+    let matched = await this.closeExpiredDirectOrders(startedAt);
     let traceId = "";
 
     // 1. Check F2F orders with bounded concurrency
@@ -367,7 +434,7 @@ export class PaymentScanner {
     const billCandidates = candidates.filter((o) => ["business_qr", "transfer", "alipay_bill", "alipay_transfer"].includes(o.collection_mode));
     if (billCandidates.length > 0) {
       try {
-        const earliest = Math.min(...billCandidates.map((order) => Date.parse(order.created_at))) - 60_000;
+        const earliest = Math.min(...billCandidates.map((order) => Date.parse(order.created_at))) - 5_000;
         const startTime = formatShanghai(new Date(earliest));
         const endTime = formatShanghai(new Date());
         const pageSize = 2_000;

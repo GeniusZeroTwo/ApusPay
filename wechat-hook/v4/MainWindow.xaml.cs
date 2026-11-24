@@ -365,7 +365,13 @@ namespace WeChatHook
             }
             try
             {
-                var request = new HttpRequestMessage(HttpMethod.Post, BuildTargetUri(apiUrl, hookToken));
+                var targetUri = BuildTargetUri(apiUrl, hookToken);
+                bool isLocal = targetUri.IsLoopback || targetUri.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase);
+                if (!isLocal && targetUri.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase))
+                {
+                    warnOnce("insecure_http", "警告：当前后端地址使用明文 HTTP，强烈建议生产环境启用 HTTPS 保护 Hook 鉴权令牌");
+                }
+                var request = new HttpRequestMessage(HttpMethod.Post, targetUri);
                 request.Headers.Add("User-Agent", "ApusPay-Hook/1.0 (Windows NT 10.0; Win64; x64)");
                 request.Headers.Add("Accept", "application/json");
                 if (!string.IsNullOrWhiteSpace(hookToken)) request.Headers.Add("X-Hook-Token", hookToken);
@@ -374,8 +380,8 @@ namespace WeChatHook
                     type = "wechat",
                     flag = message.SenderId == "gh_3dfda90e39d6" ? "reawrd-code" : "",
                     money = message.Money ?? "",
-                    token = hookToken,
                     event_id = message.SenderId + ":" + message.ServerSequence,
+                    occurred_at = message.CreateTime.ToUnixTimeSeconds(),
                 }, serializerOptions);
                 request.Content = new StringContent(jsonString, utf8, "application/json");
                 request.Content.Headers.ContentLength = utf8.GetByteCount(jsonString);
@@ -383,7 +389,22 @@ namespace WeChatHook
                 var respContent = await response.Content.ReadAsStringAsync();
                 if (response.IsSuccessStatusCode)
                 {
-                    info($"后端响应成功: {respContent}");
+                    try
+                    {
+                        using var doc = JsonDocument.Parse(respContent);
+                        if (doc.RootElement.TryGetProperty("code", out var codeProp) && codeProp.ValueKind == JsonValueKind.Number && codeProp.GetInt32() == 0)
+                        {
+                            warn($"后端未匹配到活跃待支付订单（请核对是否超时）: {respContent}");
+                        }
+                        else
+                        {
+                            info($"后端响应成功: {respContent}");
+                        }
+                    }
+                    catch
+                    {
+                        info($"后端响应成功: {respContent}");
+                    }
                     return true;
                 }
                 error($"后端返回错误 [{(int)response.StatusCode}]: {respContent}");
@@ -391,6 +412,11 @@ namespace WeChatHook
             }
             catch (Exception ex)
             {
+                var activeOptimal = CloudflareOptimizer.OptimalIp;
+                if (CloudflareOptimizer.Enabled && activeOptimal != null)
+                {
+                    CloudflareOptimizer.NotifyFailure(activeOptimal);
+                }
                 var inner = ex.InnerException != null ? $": {ex.InnerException.Message}" : "";
                 error($"提交收款记录时发生错误: {ex.Message}{inner}");
                 return false;
@@ -401,10 +427,30 @@ namespace WeChatHook
         {
             var targetHost = context.DnsEndPoint.Host;
             var port = context.DnsEndPoint.Port;
-            bool isLocalOrIp = IPAddress.TryParse(targetHost, out _)
+            bool isLocalOrIp = IPAddress.TryParse(targetHost, out var literalIp)
                 || targetHost.Equals("localhost", StringComparison.OrdinalIgnoreCase)
                 || targetHost.EndsWith(".local", StringComparison.OrdinalIgnoreCase);
-            var optimalIp = (CloudflareOptimizer.Enabled && !isLocalOrIp) ? CloudflareOptimizer.OptimalIp : null;
+
+            if (literalIp != null)
+            {
+                var ipSocket = new Socket(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+                try
+                {
+                    await ipSocket.ConnectAsync(new IPEndPoint(literalIp, port), cancellationToken);
+                    return new NetworkStream(ipSocket, ownsSocket: true);
+                }
+                catch
+                {
+                    ipSocket.Dispose();
+                    throw;
+                }
+            }
+
+            var hostEntry = await Dns.GetHostEntryAsync(targetHost, cancellationToken);
+            bool hostUsesCloudflare = hostEntry.AddressList.Any(CloudflareOptimizer.IsCloudflareIp);
+            var optimalIp = (CloudflareOptimizer.Enabled && port == 443 && !isLocalOrIp && hostUsesCloudflare)
+                ? CloudflareOptimizer.OptimalIp
+                : null;
             if (optimalIp != null)
             {
                 var socket = new Socket(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
@@ -420,7 +466,6 @@ namespace WeChatHook
                 }
             }
 
-            var hostEntry = await Dns.GetHostEntryAsync(targetHost, cancellationToken);
             var entryIp = hostEntry.AddressList.FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetwork) ?? hostEntry.AddressList[0];
             var fallbackSocket = new Socket(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
             try
@@ -579,18 +624,25 @@ namespace WeChatHook
             }
             apiUrl = GetFromConfig("api_url") ?? "";
             hookToken = UnprotectSecret(GetFromConfig("hook_token") ?? GetFromConfig("token") ?? "");
-            if (string.IsNullOrEmpty(hookToken) && !string.IsNullOrEmpty(apiUrl))
+            if (!string.IsNullOrEmpty(apiUrl))
             {
                 var extracted = ExtractTokenFromUrl(apiUrl);
                 if (!string.IsNullOrEmpty(extracted))
                 {
-                    hookToken = extracted;
+                    if (string.IsNullOrEmpty(hookToken)) hookToken = extracted;
+                    try
+                    {
+                        apiUrl = BuildTargetUri(apiUrl, "").ToString();
+                        SaveConfig();
+                    }
+                    catch { }
                 }
             }
             hexKey = UnprotectSecret(GetFromConfig("wechat_key") ?? "");
             databaseFolder = GetFromConfig("database_folder") ?? "auto";
-            string cfOpt = GetFromConfig("cf_optimize") ?? "true";
-            CloudflareOptimizer.Enabled = !string.Equals(cfOpt.Trim(), "false", StringComparison.OrdinalIgnoreCase);
+            string cfOpt = GetFromConfig("cf_optimize") ?? "false";
+            CloudflareOptimizer.Enabled = string.Equals(cfOpt.Trim(), "true", StringComparison.OrdinalIgnoreCase);
+            MenuCfOptimize.IsChecked = CloudflareOptimizer.Enabled;
             CloudflareOptimizer.ManualIp = GetFromConfig("cf_ip")?.Trim() ?? "";
             info("配置文件已重载");
             if (databaseFolder == "auto")
@@ -855,15 +907,38 @@ namespace WeChatHook
             var dialog = new DialogSetApiUrl(apiUrl);
             if (dialog.ShowDialog() == true)
             {
-                apiUrl = dialog.Text.Trim();
-                var extracted = ExtractTokenFromUrl(apiUrl);
+                var rawUrl = dialog.Text.Trim();
+                var extracted = ExtractTokenFromUrl(rawUrl);
                 if (!string.IsNullOrEmpty(extracted))
                 {
                     hookToken = extracted;
-                    info("检测到后端链接附带 Token，已自动提取并更新鉴权令牌");
+                    info("检测到后端链接附带 Token，已自动提取并剥离明文参数，改由 DPAPI 加密保存");
+                }
+                try
+                {
+                    apiUrl = string.IsNullOrEmpty(rawUrl) ? string.Empty : BuildTargetUri(rawUrl, "").ToString();
+                }
+                catch
+                {
+                    apiUrl = rawUrl;
                 }
                 SaveConfig();
                 CheckWatcherStatus();
+            }
+        }
+
+        private void ToggleCfOptimize_Click(object sender, RoutedEventArgs e)
+        {
+            CloudflareOptimizer.Enabled = MenuCfOptimize.IsChecked;
+            SaveConfig();
+            if (CloudflareOptimizer.Enabled)
+            {
+                _ = Task.Run(() => CloudflareOptimizer.RefreshAsync(silent: false));
+                info("已开启 Cloudflare 优选直连（仅对解析为 Cloudflare 官方网段的 HTTPS 域名生效）");
+            }
+            else
+            {
+                info("已关闭 Cloudflare 优选直连，恢复系统默认 DNS 解析");
             }
         }
 
@@ -951,6 +1026,7 @@ namespace WeChatHook
             watcher.EnableRaisingEvents = false;
             watcher.Dispose();
             httpClient.Dispose();
+            ReplicaStore.Reset();
             if (Directory.Exists(temp))
             {
                 foreach (var file in new DirectoryInfo(temp).GetFiles())

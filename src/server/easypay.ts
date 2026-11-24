@@ -175,20 +175,31 @@ const TAIPEI_DAY_FORMATTER = new Intl.DateTimeFormat("en-CA", {
   day: "2-digit",
 });
 
-function merchantStats(database: AppDatabase) {
+function merchantStats(database: AppDatabase, pid?: string) {
   const parts = TAIPEI_DAY_FORMATTER.formatToParts(new Date());
   const part = (type: Intl.DateTimeFormatPartTypes) => parts.find((item) => item.type === type)?.value ?? "";
   const todayIso = new Date(`${part("year")}-${part("month")}-${part("day")}T00:00:00+08:00`).toISOString();
   const yesterdayIso = new Date(Date.parse(todayIso) - 86_400_000).toISOString();
-  const total = (database.query("SELECT COUNT(*) AS count FROM orders").get() as { count: number }).count;
-  const windowRow = database.query(`
-    SELECT
-      COALESCE(SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END), 0) AS today_count,
-      COALESCE(SUM(CASE WHEN created_at >= ? AND status IN ('paid','late_paid') THEN requested_amount_cents ELSE 0 END), 0) AS today_cents,
-      COALESCE(SUM(CASE WHEN created_at < ? THEN 1 ELSE 0 END), 0) AS yesterday_count,
-      COALESCE(SUM(CASE WHEN created_at < ? AND status IN ('paid','late_paid') THEN requested_amount_cents ELSE 0 END), 0) AS yesterday_cents
-    FROM orders WHERE created_at >= ?
-  `).get(todayIso, todayIso, todayIso, todayIso, yesterdayIso) as {
+  const total = pid
+    ? (database.query("SELECT COUNT(*) AS count FROM orders WHERE pid = ?").get(pid) as { count: number }).count
+    : (database.query("SELECT COUNT(*) AS count FROM orders").get() as { count: number }).count;
+  const windowRow = (pid
+    ? database.query(`
+        SELECT
+          COALESCE(SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END), 0) AS today_count,
+          COALESCE(SUM(CASE WHEN created_at >= ? AND status IN ('paid','late_paid') THEN requested_amount_cents ELSE 0 END), 0) AS today_cents,
+          COALESCE(SUM(CASE WHEN created_at < ? THEN 1 ELSE 0 END), 0) AS yesterday_count,
+          COALESCE(SUM(CASE WHEN created_at < ? AND status IN ('paid','late_paid') THEN requested_amount_cents ELSE 0 END), 0) AS yesterday_cents
+        FROM orders WHERE pid = ? AND created_at >= ?
+      `).get(todayIso, todayIso, todayIso, todayIso, pid, yesterdayIso)
+    : database.query(`
+        SELECT
+          COALESCE(SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END), 0) AS today_count,
+          COALESCE(SUM(CASE WHEN created_at >= ? AND status IN ('paid','late_paid') THEN requested_amount_cents ELSE 0 END), 0) AS today_cents,
+          COALESCE(SUM(CASE WHEN created_at < ? THEN 1 ELSE 0 END), 0) AS yesterday_count,
+          COALESCE(SUM(CASE WHEN created_at < ? AND status IN ('paid','late_paid') THEN requested_amount_cents ELSE 0 END), 0) AS yesterday_cents
+        FROM orders WHERE created_at >= ?
+      `).get(todayIso, todayIso, todayIso, todayIso, yesterdayIso)) as {
     today_count: number;
     today_cents: number;
     yesterday_count: number;
@@ -257,11 +268,13 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
       verifyV1Key(database, parameters);
       const act = parameters.act;
       if (act === "query") {
-        const stats = merchantStats(database);
+        const stats = merchantStats(database, parameters.pid);
+        const v1Key = getSecret(database, "v1_key");
+        const maskedKey = v1Key ? `${v1Key.slice(0, 4)}••••••••${v1Key.slice(-4)}` : "";
         return c.json({
           code: 1,
           pid: Number(parameters.pid),
-          key: getSecret(database, "v1_key"),
+          key: getSetting(database, "v1_echo_plaintext_key", false) ? v1Key : maskedKey,
           active: 1,
           money: "0.00",
           type: 0,
@@ -281,7 +294,7 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
       if (act === "orders") {
         const limit = parseBoundedInt(parameters.limit, 20, 1, 50);
         const page = parseBoundedInt(parameters.page, 1, 1, 1_000_000);
-        const result = listOrders(database, { limit, offset: (page - 1) * limit });
+        const result = listOrders(database, { pid: parameters.pid, limit, offset: (page - 1) * limit });
         return c.json({ code: 1, msg: "查询订单列表成功！", data: result.data.map(serializeOrder) });
       }
       throw new AppError(400, "UNSUPPORTED_ACTION", "不支持的 act，仅支持 query、order、orders");
@@ -357,7 +370,7 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
     try {
       const parameters = await requestParameters(c);
       verifyV2(database, parameters);
-      const stats = merchantStats(database);
+      const stats = merchantStats(database, parameters.pid);
       return c.json(signedV2(database, {
         code: 0,
         msg: "success",
@@ -386,7 +399,7 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
       verifyV2(database, parameters);
       const limit = parseBoundedInt(parameters.limit, 50, 1, 50);
       const offset = parseBoundedInt(parameters.offset, 0, 0, 10_000_000);
-      const result = listOrders(database, { limit, offset });
+      const result = listOrders(database, { pid: parameters.pid, limit, offset });
       return c.json(signedV2(database, { code: 0, msg: "success", data: result.data.map(serializeOrder) }));
     } catch (error) {
       return v2Failure(c, database, error);
@@ -421,11 +434,22 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
           if (!transactionId) {
             return c.json({ code: "FAIL", message: "缺少微信交易单号" }, 400);
           }
+          const amountObj = decrypted.amount as Record<string, unknown> | undefined;
+          const currency = amountObj?.currency;
+          if (currency !== undefined && currency !== "CNY") {
+            return c.json({ code: "FAIL", message: "支付币种不匹配" }, 400);
+          }
+          const rawSuccessTime = decrypted.success_time !== undefined && decrypted.success_time !== null
+            ? String(decrypted.success_time).trim()
+            : "";
+          if (rawSuccessTime && !Number.isFinite(Date.parse(rawSuccessTime))) {
+            return c.json({ code: "FAIL", message: "支付时间格式无效" }, 400);
+          }
           const order = database.query(
             "SELECT * FROM orders WHERE type = 'wxpay' AND collection_mode = 'wxpay_native' AND trade_no = ?",
           ).get(outTradeNo) as OrderRecord | null;
           if (order) {
-            const paidCents = Number((decrypted.amount as Record<string, unknown> | undefined)?.total);
+            const paidCents = Number(amountObj?.total);
             if (!Number.isInteger(paidCents) || paidCents !== order.payable_amount_cents) {
               return c.json({ code: "FAIL", message: "支付金额不匹配" }, 400);
             }
@@ -439,7 +463,7 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
               channel: "wxpay",
               channelOrderId: transactionId,
               buyer: String((decrypted.payer as Record<string, unknown>)?.openid ?? ""),
-              occurredAt: String(decrypted.success_time ?? new Date().toISOString()),
+              occurredAt: rawSuccessTime || new Date().toISOString(),
             });
           }
         }
@@ -460,48 +484,56 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
 
   // PC WeChat Hook endpoint health check & connectivity diagnostics
   app.get("/api/hook/receive", async (c) => {
-    const ip = clientIp(c.req.raw.headers, c.req.raw) || "unknown";
-    const rateKey = `hook:${ip}`;
-    checkLoginRateLimit(rateKey);
+    try {
+      const ip = clientIp(c.req.raw.headers, c.req.raw) || "unknown";
+      const rateKey = `hook:${ip}`;
+      const queryToken = c.req.query("token") ?? "";
+      const headerToken = c.req.header("x-hook-token") ?? c.req.header("authorization")?.replace(/^Bearer\s+/i, "") ?? "";
+      const token = (queryToken || headerToken).trim();
+      const expectedToken = getSecret(database, "wxpay_hook_token");
 
-    const queryToken = c.req.query("token") ?? "";
-    const headerToken = c.req.header("x-hook-token") ?? c.req.header("authorization")?.replace(/^Bearer\s+/i, "") ?? "";
-    const token = (queryToken || headerToken).trim();
-    const expectedToken = getSecret(database, "wxpay_hook_token");
+      if (!expectedToken) {
+        return c.json({
+          code: -1,
+          status: "unconfigured",
+          msg: "服务尚未配置 wxpay_hook_token，请先在管理后台设置 Hook 鉴权 Token",
+          authenticated: false,
+        }, 503);
+      }
 
-    if (!expectedToken) {
+      if (!token) {
+        checkLoginRateLimit(rateKey);
+        return c.json({
+          code: 0,
+          status: "pending_auth",
+          msg: "ApusPay Hook 接口就绪（已启用 Token 保护，请求时请附带 X-Hook-Token 请求头）",
+          authenticated: false,
+        });
+      }
+      if (!checkHookTokenMatch(token, expectedToken)) {
+        checkLoginRateLimit(rateKey);
+        checkLoginRateLimit("hook:global");
+        recordLoginFailure(rateKey);
+        recordLoginFailure("hook:global", 30);
+        return c.json({
+          code: -1,
+          status: "unauthorized",
+          msg: "Hook 鉴权失败：提供的 Token 与服务端配置不一致",
+          authenticated: false,
+        }, 401);
+      }
       return c.json({
-        code: -1,
-        status: "unconfigured",
-        msg: "服务尚未配置 wxpay_hook_token，请先在管理后台设置 Hook 鉴权 Token",
-        authenticated: false,
-      }, 503);
-    }
-
-    if (!token) {
-      return c.json({
-        code: 0,
-        status: "pending_auth",
-        msg: "ApusPay Hook 接口就绪（已启用 Token 保护，请求时请附带 X-Hook-Token 请求头）",
-        authenticated: false,
+        code: 1,
+        status: "ok",
+        msg: "ApusPay Hook 接口就绪，Token 鉴权通过",
+        authenticated: true,
       });
+    } catch (error) {
+      if (error instanceof AppError) {
+        return c.json({ code: -1, msg: error.message, authenticated: false }, error.status as 401 | 429 | 500 | 503);
+      }
+      return c.json({ code: -1, msg: "请求处理失败", authenticated: false }, 500);
     }
-    if (!checkHookTokenMatch(token, expectedToken)) {
-      recordLoginFailure(rateKey);
-      return c.json({
-        code: -1,
-        status: "unauthorized",
-        msg: "Hook 鉴权失败：提供的 Token 与服务端配置不一致",
-        authenticated: false,
-      }, 401);
-    }
-    clearLoginFailures(rateKey);
-    return c.json({
-      code: 1,
-      status: "ok",
-      msg: "ApusPay Hook 接口就绪，Token 鉴权通过",
-      authenticated: true,
-    });
   });
 
   // PC WeChat Hook / SweetCheckout Hook receiver
@@ -509,7 +541,6 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
     try {
       const ip = clientIp(c.req.raw.headers, c.req.raw) || "unknown";
       const rateKey = `hook:${ip}`;
-      checkLoginRateLimit(rateKey);
 
       const body = ((await c.req.json().catch(() => ({}))) ?? {}) as Record<string, unknown>;
       const type = String(body.type ?? "wechat").toLowerCase().trim().slice(0, 32);
@@ -537,12 +568,15 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
         console.error(JSON.stringify({ level: "error", event: "hook_unconfigured", ip }));
         return c.json({ code: -1, msg: "hook token not configured" }, 503);
       }
+      // Valid token bypasses unauthenticated brute-force bucket so attackers cannot DoS real Hook deliveries
       if (hasTokenConflict || !checkHookTokenMatch(token, expectedToken)) {
+        checkLoginRateLimit(rateKey);
+        checkLoginRateLimit("hook:global");
         recordLoginFailure(rateKey);
+        recordLoginFailure("hook:global", 30);
         console.warn(JSON.stringify({ level: "warn", event: "hook_auth_failed", ip, conflict: hasTokenConflict }));
         return c.json({ code: -1, msg: hasTokenConflict ? "conflicting hook tokens" : "invalid hook token" }, 401);
       }
-      clearLoginFailures(rateKey);
 
       if (!money) {
         return c.json({ code: -1, msg: "missing money" }, 400);
@@ -551,48 +585,102 @@ export function createEasyPayRoutes(database: AppDatabase, scanner: PaymentScann
         return c.json({ code: -1, msg: "unsupported hook channel type" }, 400);
       }
 
+      const rawEventId = body.event_id !== undefined && body.event_id !== null ? String(body.event_id).trim() : "";
+      if (rawEventId && !/^[A-Za-z0-9_.:@-]{1,128}$/.test(rawEventId)) {
+        return c.json({ code: -1, msg: "invalid event_id format" }, 400);
+      }
+      if (!rawEventId && getSetting(database, "hook_require_event_id", false)) {
+        return c.json({ code: -1, msg: "missing event_id" }, 400);
+      }
+      const eventId = rawEventId;
+
+      if (body.occurred_at !== undefined && body.occurred_at !== null && String(body.occurred_at).trim() !== "") {
+        const rawOccurred = String(body.occurred_at).trim();
+        const occurredMs = /^\d{10}$/.test(rawOccurred) ? Number(rawOccurred) * 1_000 : Date.parse(rawOccurred);
+        if (!Number.isFinite(occurredMs) || Math.abs(Date.now() - occurredMs) > 15 * 60_000) {
+          return c.json({ code: -1, msg: "invalid or expired occurred_at" }, 400);
+        }
+      }
+
       const cleanMoney = money.replace(/^[￥¥\$\s]+/, "").trim();
       const amountCents = parseMoneyToCents(cleanMoney);
       const targetChannel = type === "wechat" || type === "wxpay" ? "wxpay" : "alipay";
       const targetCollectionMode = targetChannel === "wxpay" ? "wxpay_hook" : "business_qr";
-      const rawEventId = String(body.event_id ?? "").trim();
-      const eventId = /^[A-Za-z0-9_:\-]{1,128}$/.test(rawEventId) ? rawEventId : "";
 
       if (eventId) {
         const seen = database.query("SELECT trade_no FROM hook_events WHERE event_id = ?").get(eventId) as { trade_no: string } | null;
         if (seen) {
-          return c.json({ code: 1, msg: "重复通知已忽略", trade_no: seen.trade_no, duplicate: true });
+          return c.json({
+            code: 1,
+            msg: "重复通知已忽略",
+            trade_no: seen.trade_no === "UNMATCHED" ? "" : seen.trade_no,
+            duplicate: true,
+          });
         }
       }
 
+      if (targetChannel === "wxpay" && !getSetting(database, "wxpay_enabled", true)) {
+        return c.json({ code: -1, msg: "wxpay channel disabled" }, 403);
+      }
+      if (targetChannel === "alipay" && (!getSetting(database, "alipay_enabled", true) || !getSetting(database, "alipay_hook_enabled", false))) {
+        if (eventId) {
+          database.query("INSERT OR IGNORE INTO hook_events(event_id, trade_no, created_at) VALUES (?, 'UNMATCHED', ?)").run(eventId, new Date().toISOString());
+        }
+        return c.json({ code: 0, msg: "未找到待支付的匹配订单", money: cleanMoney, type: targetChannel });
+      }
+
       // Match pending order strictly within Hook-eligible collection mode (never official native/f2f/transfer)
+      const nowIso = new Date().toISOString();
       const candidate = database.query(`
         SELECT * FROM orders
         WHERE type = ? AND collection_mode = ? AND status IN ('pending', 'expired') AND payable_amount_cents = ? AND monitor_until > ?
         ORDER BY created_at ASC LIMIT 1
-      `).get(targetChannel, targetCollectionMode, amountCents, new Date().toISOString()) as OrderRecord | null;
+      `).get(targetChannel, targetCollectionMode, amountCents, nowIso) as OrderRecord | null;
 
       if (!candidate) {
+        if (eventId) {
+          database.query("INSERT OR IGNORE INTO hook_events(event_id, trade_no, created_at) VALUES (?, 'UNMATCHED', ?)").run(eventId, nowIso);
+        }
         console.warn(JSON.stringify({
           level: "warn",
           event: "hook_unmatched",
           channel: targetChannel,
           amount_cents: amountCents,
+          event_id: eventId || undefined,
         }));
         return c.json({ code: 0, msg: "未找到待支付的匹配订单", money: cleanMoney, type: targetChannel });
       }
 
-      const paid = markOrderPaidDirectly(database, candidate.id, {
-        channel: targetChannel,
-        channelOrderId: eventId ? `HOOK-${eventId}` : `HOOK-${Date.now()}`,
-        buyer: "PC-Hook",
-        eventId: eventId || undefined,
-      });
+      let paid = false;
+      try {
+        paid = markOrderPaidDirectly(database, candidate.id, {
+          channel: targetChannel,
+          channelOrderId: eventId ? `HOOK-${eventId}` : `HOOK-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`,
+          buyer: "PC-Hook",
+          eventId: eventId || undefined,
+        });
+      } catch (err) {
+        if (eventId && err instanceof Error && /UNIQUE constraint failed: hook_events\.event_id/i.test(err.message)) {
+          const seen = database.query("SELECT trade_no FROM hook_events WHERE event_id = ?").get(eventId) as { trade_no: string } | null;
+          return c.json({
+            code: 1,
+            msg: "重复通知已忽略",
+            trade_no: seen?.trade_no === "UNMATCHED" ? "" : (seen?.trade_no ?? ""),
+            duplicate: true,
+          });
+        }
+        throw err;
+      }
       if (!paid) {
         if (eventId) {
           const seen = database.query("SELECT trade_no FROM hook_events WHERE event_id = ?").get(eventId) as { trade_no: string } | null;
           if (seen) {
-            return c.json({ code: 1, msg: "重复通知已忽略", trade_no: seen.trade_no, duplicate: true });
+            return c.json({
+              code: 1,
+              msg: "重复通知已忽略",
+              trade_no: seen.trade_no === "UNMATCHED" ? "" : seen.trade_no,
+              duplicate: true,
+            });
           }
         }
         return c.json({ code: 0, msg: "订单状态已变化" }, 409);

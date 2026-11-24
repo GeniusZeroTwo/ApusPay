@@ -74,8 +74,8 @@ export function OrderDetailPage() {
             <Button
               variant="outline"
               onClick={async () => {
-                await apiFetch("/admin-api/scans/run", { method: "POST" });
-                toast.success("扫描已完成");
+                const res = await apiFetch<{ matched: boolean }>(`/admin-api/orders/${id}/sync`, { method: "POST" });
+                toast.success(res.matched ? "查单命中，订单已入账" : "查单已完成，暂未检测到新入账");
                 await mutate();
               }}
             >

@@ -292,4 +292,156 @@ describe("admin session and CSRF", () => {
     });
     expect(crossOriginLogout.status).toBe(403);
   });
+
+  it("enforces SETUP_TOKEN, trusted proxy HTTPS Origin, Secure cookies, atomic settings/secrets rollback, password max length, and idempotent mark-paid", async () => {
+    const { createDatabase, setSetting } = await import("../src/server/db");
+    const { resetRuntimeEnvForTests } = await import("../src/server/env");
+    const { attachSocketIp } = await import("../src/server/auth");
+    const { createOrder } = await import("../src/server/orders");
+    const { generateRsaKeyPair } = await import("../src/server/security");
+
+    const prevNodeEnv = process.env.NODE_ENV;
+    const prevSetupToken = process.env.SETUP_TOKEN;
+    const prevTrustProxy = process.env.TRUST_PROXY;
+    const prevPublicBase = process.env.PUBLIC_BASE_URL;
+
+    try {
+      process.env.NODE_ENV = "production";
+      process.env.SETUP_TOKEN = "prod-one-time-setup-token-999";
+      process.env.TRUST_PROXY = "true";
+      process.env.PUBLIC_BASE_URL = "https://pay.example.com";
+      resetRuntimeEnvForTests();
+
+      database = createDatabase(":memory:");
+      const scanner = new PaymentScanner(database, new EmptyProvider());
+      const { app } = createApp({ database, scanner, notifications: new NotificationWorker(database, fetch) });
+
+      // 1. Headerless setup in production is rejected (no empty-Origin bypass)
+      const headerlessReq = new Request("http://pay.myshop.com/admin-api/setup", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ password: "prod-admin-password-123", public_base_url: "https://pay.myshop.com", setup_token: "prod-one-time-setup-token-999" }),
+      });
+      attachSocketIp(headerlessReq, "127.0.0.1");
+      expect((await app.fetch(headerlessReq)).status).toBe(403);
+
+      // 2. Untrusted public peer IP cannot spoof X-Forwarded-Proto
+      const untrustedPeerReq = new Request("http://pay.myshop.com/admin-api/setup", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-forwarded-proto": "https",
+          origin: "https://pay.myshop.com",
+        },
+        body: JSON.stringify({ password: "prod-admin-password-123", public_base_url: "https://pay.myshop.com", setup_token: "prod-one-time-setup-token-999" }),
+      });
+      attachSocketIp(untrustedPeerReq, "198.51.100.77");
+      expect((await app.fetch(untrustedPeerReq)).status).toBe(403);
+
+      // 3. Missing/wrong setup_token is rejected even with valid trusted proxy HTTPS Origin
+      const wrongTokenReq = new Request("http://pay.myshop.com/admin-api/setup", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-forwarded-proto": "https",
+          origin: "https://pay.myshop.com",
+        },
+        body: JSON.stringify({ password: "prod-admin-password-123", public_base_url: "https://pay.myshop.com", setup_token: "wrong" }),
+      });
+      attachSocketIp(wrongTokenReq, "127.0.0.1");
+      expect((await app.fetch(wrongTokenReq)).status).toBe(403);
+
+      // 4. Trusted proxy + X-Forwarded-Proto: https + valid setup_token succeeds and issues Secure cookies
+      const validSetupReq = new Request("http://pay.myshop.com/admin-api/setup", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-forwarded-proto": "https",
+          origin: "https://pay.myshop.com",
+        },
+        body: JSON.stringify({ password: "prod-admin-password-123", public_base_url: "https://pay.myshop.com", setup_token: "prod-one-time-setup-token-999" }),
+      });
+      attachSocketIp(validSetupReq, "127.0.0.1");
+      const setupRes = await app.fetch(validSetupReq);
+      expect(setupRes.status).toBe(200);
+      const setCookies = setupRes.headers.get("set-cookie") ?? "";
+      expect(setCookies).toContain("Secure");
+      const sessionVal = setCookies.match(/apuspay_session=([^;]+)/)![1]!;
+      const csrfVal = setCookies.match(/apuspay_csrf=([^;]+)/)![1]!;
+      const authHeaders = {
+        cookie: `apuspay_session=${sessionVal}; apuspay_csrf=${csrfVal}`,
+        "x-csrf-token": csrfVal,
+        origin: "https://pay.myshop.com",
+        "content-type": "application/json",
+      };
+
+      // 5. Atomic rollback on PUT /keys/wxpay/secrets when hook_token is too short
+      const wxKeys = generateRsaKeyPair();
+      const partialSecretRes = await app.request("https://pay.myshop.com/admin-api/keys/wxpay/secrets", {
+        method: "PUT",
+        headers: authHeaders,
+        body: JSON.stringify({ private_key: wxKeys.privateKey, hook_token: "short" }),
+      });
+      expect(partialSecretRes.status).toBe(400);
+      const settingsAfterFail = await (await app.request("https://pay.myshop.com/admin-api/settings", { headers: authHeaders })).json() as { has_wxpay_private_key: boolean };
+      expect(settingsAfterFail.has_wxpay_private_key).toBe(false);
+
+      // 6. Private SSRF alipay_endpoint is rejected, and switching alipay_mode back to f2f overrides legacy collection_mode
+      setSetting(database, "collection_mode", "transfer");
+      const ssrfEndpoint = await app.request("https://pay.myshop.com/admin-api/settings", {
+        method: "PUT",
+        headers: authHeaders,
+        body: JSON.stringify({ alipay_endpoint: "https://127.0.0.1/gateway" }),
+      });
+      expect(ssrfEndpoint.status).toBe(400);
+
+      const switchF2f = await app.request("https://pay.myshop.com/admin-api/settings", {
+        method: "PUT",
+        headers: authHeaders,
+        body: JSON.stringify({
+          alipay_mode: "f2f",
+          alipay_app_id: "2026000000000001",
+          alipay_public_key: wxKeys.publicKey,
+        }),
+      });
+      expect(switchF2f.status).toBe(200);
+      process.env.NODE_ENV = "test";
+      resetRuntimeEnvForTests();
+      const f2fOrder = (await createOrder(database, {
+        pid: (await (await app.request("https://pay.myshop.com/admin-api/settings", { headers: authHeaders })).json() as { merchant_pid: string }).merchant_pid,
+        apiVersion: "v1",
+        type: "alipay",
+        outTradeNo: "SWITCH-F2F-1",
+        name: "F2F switched",
+        money: "1.00",
+        notifyUrl: "https://8.8.8.8/notify",
+      })).order;
+      expect(f2fOrder.collection_mode).toBe("alipay_f2f");
+
+      // 7. >128 char password rejected (400), and duplicate mark-paid returns 409
+      const tooLongPwd = await app.request("https://pay.myshop.com/admin-api/password", {
+        method: "PUT",
+        headers: authHeaders,
+        body: JSON.stringify({ current_password: "prod-admin-password-123", new_password: "x".repeat(129) }),
+      });
+      expect(tooLongPwd.status).toBe(400);
+
+      const firstMark = await app.request(`https://pay.myshop.com/admin-api/orders/${f2fOrder.id}/mark-paid`, {
+        method: "POST",
+        headers: authHeaders,
+      });
+      expect(firstMark.status).toBe(200);
+      const secondMark = await app.request(`https://pay.myshop.com/admin-api/orders/${f2fOrder.id}/mark-paid`, {
+        method: "POST",
+        headers: authHeaders,
+      });
+      expect(secondMark.status).toBe(409);
+    } finally {
+      if (prevNodeEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = prevNodeEnv;
+      if (prevSetupToken === undefined) delete process.env.SETUP_TOKEN; else process.env.SETUP_TOKEN = prevSetupToken;
+      if (prevTrustProxy === undefined) delete process.env.TRUST_PROXY; else process.env.TRUST_PROXY = prevTrustProxy;
+      if (prevPublicBase === undefined) delete process.env.PUBLIC_BASE_URL; else process.env.PUBLIC_BASE_URL = prevPublicBase;
+      resetRuntimeEnvForTests();
+    }
+  });
 });

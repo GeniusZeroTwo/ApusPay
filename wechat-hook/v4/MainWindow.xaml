@@ -21,6 +21,8 @@
                 <MenuItem Header="重载配置文件" Click="ReloadConfig_Click"/>
             </MenuItem>
             <MenuItem Header="工具">
+                <MenuItem x:Name="MenuCfOptimize" Header="启用 Cloudflare 优选直连" IsCheckable="True" Click="ToggleCfOptimize_Click"/>
+                <Separator />
                 <MenuItem Header="解密数据库文件" Click="ToolsCustomDecrypt_Click"/>
             </MenuItem>
         </Menu>

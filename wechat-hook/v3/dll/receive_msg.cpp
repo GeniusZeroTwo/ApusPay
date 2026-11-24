@@ -72,13 +72,40 @@ static string to_string(WxMsg_t wxMsg) {
     return j.dump(4);
 }
 
+static std::pair<std::string, std::string> SplitUrlAndToken(const char* rawUrl)
+{
+    std::string full(rawUrl ? rawUrl : "");
+    auto qPos = full.find('?');
+    if (qPos == std::string::npos) return { full, "" };
+
+    std::string base = full.substr(0, qPos);
+    std::string query = full.substr(qPos + 1);
+    std::string extractedToken;
+    std::string keptQuery;
+    size_t start = 0;
+    while (start <= query.size()) {
+        auto amp = query.find('&', start);
+        std::string part = amp == std::string::npos ? query.substr(start) : query.substr(start, amp - start);
+        if (part.rfind("token=", 0) == 0) {
+            extractedToken = part.substr(6);
+        } else if (!part.empty()) {
+            if (!keptQuery.empty()) keptQuery += "&";
+            keptQuery += part;
+        }
+        if (amp == std::string::npos) break;
+        start = amp + 1;
+    }
+    return { keptQuery.empty() ? base : (base + "?" + keptQuery), extractedToken };
+}
+
 static void notice(string content)
 {
     CURL* curl;
     CURLcode res;
     long res_code = 0;
     const char* postContent = content.c_str();
-    const char* url = baseUrl;
+    auto parsedTarget = SplitUrlAndToken(baseUrl);
+    const char* url = parsedTarget.first.c_str();
     struct curl_slist* header = NULL;
     
     res = curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -90,7 +117,7 @@ static void notice(string content)
     curl = curl_easy_init();
     if (curl)
     {
-        LOG_INFO("Send to backend {}: {}", url, postContent);
+        LOG_INFO("Send payment event to backend {}", url);
 
         curl_easy_setopt(curl, CURLOPT_URL, url);
         
@@ -98,16 +125,21 @@ static void notice(string content)
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postContent);
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(postContent));
 
-        header = curl_slist_append(header, "Accept: */*");
+        header = curl_slist_append(header, "Accept: application/json");
         header = curl_slist_append(header, "Content-Type: application/json; charset=utf-8");
         header = curl_slist_append(header, "Connection: Close");
+        if (!parsedTarget.second.empty()) {
+            std::string authHeader = "X-Hook-Token: " + parsedTarget.second;
+            header = curl_slist_append(header, authHeader.c_str());
+        }
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, header);
         curl_easy_setopt(curl, CURLOPT_HEADER, 0L);
 
-        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
         curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
 
-        curl_easy_setopt(curl, CURLOPT_USERAGENT, "curl/8.11.0");
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "ApusPay-Hook-v3/1.0");
 
         res = curl_easy_perform(curl);
         if (res != CURLE_OK)
@@ -166,10 +198,6 @@ static QWORD DispatchMsg(QWORD arg1, QWORD arg2)
                 std::string content = isGB2312(wxMsg.content)
                     ? GB2312ToUtf8(wxMsg.content.c_str())
                     : wxMsg.content;
-                nlohmann::json to_log = {
-                    { "content", content }
-                };
-                LOG_INFO(u8"Received specific message from gh_f0a92aa7146c (微信收款助手): {}", to_log.dump());
                 if (content.find(u8"<appname><![CDATA[微信收款助手]]></appname>") != string::npos)
                 {
                     // 同时满足 微信支付收款 和 店员消息 的格式
@@ -179,12 +207,16 @@ static QWORD DispatchMsg(QWORD arg1, QWORD arg2)
                     if (std::regex_search(content.begin(), content.end(), group, pat) && group.size() > 1)
                     {
                         std::string money = group[2].str();
+                        std::string eventId = wxMsg.roomid + ":" + std::to_string(wxMsg.id);
+                        LOG_INFO("Detected gh_f0a92aa7146c payment event_id={} money={}", eventId, money);
                         nlohmann::json j = {
                             { "type", "wechat" },
                             { "flags", "" },
-                            { "money", money }
+                            { "money", money },
+                            { "event_id", eventId },
+                            { "occurred_at", wxMsg.ts }
                         };
-                        notice(j.dump(4));
+                        notice(j.dump());
                     }
                 }
             }
@@ -194,10 +226,6 @@ static QWORD DispatchMsg(QWORD arg1, QWORD arg2)
                 std::string content = isGB2312(wxMsg.content)
                     ? GB2312ToUtf8(wxMsg.content.c_str())
                     : wxMsg.content;
-                nlohmann::json to_log = {
-                    { "content", content }
-                };
-                LOG_INFO(u8"Received specific message from gh_3dfda90e39d6 (微信支付): {}", to_log.dump());
                 if (content.find(u8"<appname><![CDATA[微信支付]]></appname>") != string::npos)
                 {
                     std::string pattern = u8"二维码赞赏到账(\\d+\\.\\d{2})元";
@@ -206,12 +234,16 @@ static QWORD DispatchMsg(QWORD arg1, QWORD arg2)
                     if (std::regex_search(content.begin(), content.end(), group, pat) && group.size() > 1)
                     {
                         std::string money = group[1].str();
+                        std::string eventId = wxMsg.roomid + ":" + std::to_string(wxMsg.id);
+                        LOG_INFO("Detected gh_3dfda90e39d6 reward event_id={} money={}", eventId, money);
                         nlohmann::json j = {
                             { "type", "wechat" },
                             { "flags", "reward-code" },
-                            { "money", money }
+                            { "money", money },
+                            { "event_id", eventId },
+                            { "occurred_at", wxMsg.ts }
                         };
-                        notice(j.dump(4));
+                        notice(j.dump());
                     }
                 }
             }

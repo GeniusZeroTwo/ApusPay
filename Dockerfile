@@ -1,4 +1,4 @@
-FROM oven/bun:alpine AS build
+FROM oven/bun:1.4.2-alpine AS build
 WORKDIR /app
 
 COPY package.json bun.lock ./
@@ -8,7 +8,7 @@ COPY index.html tsconfig.json vite.config.ts components.json ./
 COPY src ./src
 RUN bun run build
 
-FROM oven/bun:alpine AS runtime
+FROM oven/bun:1.4.2-alpine AS runtime
 WORKDIR /app
 
 ENV NODE_ENV=production \
@@ -22,7 +22,7 @@ COPY --from=build /app/dist ./dist
 COPY src/server ./src/server
 COPY src/shared ./src/shared
 
-RUN mkdir -p /data/uploads && chown -R bun:bun /data /app
+RUN mkdir -p /data/uploads && chmod 700 /data /data/uploads && chown -R bun:bun /data /app
 USER bun
 
 EXPOSE 3000

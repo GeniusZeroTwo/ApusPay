@@ -1,11 +1,11 @@
-import { existsSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { extname, resolve, sep } from "node:path";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { secureHeaders } from "hono/secure-headers";
 import { createAdminRoutes } from "./admin";
 import { PaymentScanner } from "./alipay";
-import { attachSocketIp } from "./auth";
+import { attachSocketIp, getAttachedSocketIp } from "./auth";
 import { getDatabase, type AppDatabase } from "./db";
 import { createEasyPayRoutes } from "./easypay";
 import { getRuntimeEnv } from "./env";
@@ -67,12 +67,13 @@ export function createApp(services?: Partial<AppServices>) {
     c.header("x-request-id", requestId);
     await next();
     if (!c.req.path.startsWith("/public-api/checkout/")) {
+      const safePath = c.req.path.startsWith("/checkout/") ? "/checkout/[REDACTED]" : c.req.path;
       console.log(JSON.stringify({
         level: "info",
         event: "http_request",
         request_id: requestId,
         method: c.req.method,
-        path: c.req.path,
+        path: safePath,
         status: c.res.status,
         duration_ms: Math.round((performance.now() - started) * 10) / 10,
       }));
@@ -81,13 +82,17 @@ export function createApp(services?: Partial<AppServices>) {
 
   app.use("*", async (c, next) => {
     if (["GET", "HEAD", "OPTIONS"].includes(c.req.method)) return next();
+    const initialSocketIp = getAttachedSocketIp(c.req.raw);
     const isQrUpload = c.req.path === "/admin-api/settings/qr" || c.req.path === "/admin-api/settings/qr/wechat";
     const maxSize = isQrUpload ? 6 * 1024 * 1024 : 256 * 1024;
     const limiter = bodyLimit({
       maxSize,
       onError: (ctx) => ctx.json({ error: "PAYLOAD_TOO_LARGE", message: "请求体超出大小限制" }, 413),
     });
-    return limiter(c, next);
+    return limiter(c, async () => {
+      if (initialSocketIp) attachSocketIp(c.req.raw, initialSocketIp);
+      await next();
+    });
   });
 
   app.get("/healthz", (c) => c.json({ ok: true, version: "1.0.0", bun: Bun.version }));
@@ -181,11 +186,46 @@ export function createApp(services?: Partial<AppServices>) {
   return { app, services: { database, scanner, notifications } };
 }
 
+function acquireSingleWriterLock(dataDir: string): () => void {
+  const lockPath = resolve(dataDir, ".apuspay.lock");
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const fd = openSync(lockPath, "wx", 0o600);
+      writeFileSync(fd, `${process.pid}\n`, "utf8");
+      closeSync(fd);
+      return () => {
+        try {
+          const holder = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
+          if (holder === process.pid) rmSync(lockPath, { force: true });
+        } catch {
+          // Ignore lock cleanup errors
+        }
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      try {
+        const holderPid = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
+        if (Number.isInteger(holderPid) && holderPid > 0 && holderPid !== process.pid) {
+          process.kill(holderPid, 0);
+          throw new Error(`数据目录 ${dataDir} 已被另一运行中的 ApusPay 进程 (PID ${holderPid}) 占用，禁止多进程并发写库`);
+        }
+      } catch (probeErr) {
+        if ((probeErr as NodeJS.ErrnoException).code !== "ESRCH") {
+          if (probeErr instanceof Error && probeErr.message.includes("已被另一运行中")) throw probeErr;
+        }
+      }
+      rmSync(lockPath, { force: true });
+    }
+  }
+  throw new Error(`无法获取数据目录排他锁: ${lockPath}`);
+}
+
 if (import.meta.main) {
+  const runtime = getRuntimeEnv();
+  const releaseLock = acquireSingleWriterLock(runtime.dataDir);
   const { app, services } = createApp();
   services.scanner.start();
   services.notifications.start();
-  const runtime = getRuntimeEnv();
   const server = Bun.serve({
     hostname: runtime.host,
     port: runtime.port,
@@ -199,8 +239,10 @@ if (import.meta.main) {
   const shutdown = () => {
     services.scanner.stop();
     services.notifications.stop();
+    releaseLock();
     void server.stop(true);
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+  process.on("exit", releaseLock);
 }

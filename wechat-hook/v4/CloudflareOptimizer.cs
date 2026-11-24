@@ -38,8 +38,50 @@ namespace WeChatHook
             "104.19.19.1"
         ];
 
-        public static bool Enabled { get; set; } = true;
+        // Cloudflare 官方 IPv4 Anycast 网段列表（仅当目标域名本身解析至 Cloudflare 网段时才允许优选直连）
+        private static readonly (uint Network, uint Mask)[] OfficialCloudflareCidrs =
+        [
+            ParseCidr("173.245.48.0/20"),
+            ParseCidr("103.21.244.0/22"),
+            ParseCidr("103.22.200.0/22"),
+            ParseCidr("103.31.4.0/22"),
+            ParseCidr("141.101.64.0/18"),
+            ParseCidr("108.162.192.0/18"),
+            ParseCidr("190.93.240.0/20"),
+            ParseCidr("188.114.96.0/20"),
+            ParseCidr("197.234.240.0/22"),
+            ParseCidr("198.41.128.0/17"),
+            ParseCidr("162.158.0.0/15"),
+            ParseCidr("104.16.0.0/13"),
+            ParseCidr("104.24.0.0/14"),
+            ParseCidr("172.64.0.0/13"),
+            ParseCidr("131.0.72.0/22"),
+        ];
+
+        public static bool Enabled { get; set; } = false;
         public static string ManualIp { get; set; } = "";
+
+        private static (uint Network, uint Mask) ParseCidr(string cidr)
+        {
+            var parts = cidr.Split('/');
+            var bytes = IPAddress.Parse(parts[0]).GetAddressBytes();
+            int prefix = int.Parse(parts[1]);
+            uint ip = ((uint)bytes[0] << 24) | ((uint)bytes[1] << 16) | ((uint)bytes[2] << 8) | bytes[3];
+            uint mask = prefix == 0 ? 0u : (0xFFFFFFFFu << (32 - prefix));
+            return (ip & mask, mask);
+        }
+
+        public static bool IsCloudflareIp(IPAddress ip)
+        {
+            if (ip.AddressFamily != AddressFamily.InterNetwork) return false;
+            var bytes = ip.GetAddressBytes();
+            uint val = ((uint)bytes[0] << 24) | ((uint)bytes[1] << 16) | ((uint)bytes[2] << 8) | bytes[3];
+            foreach (var (network, mask) in OfficialCloudflareCidrs)
+            {
+                if ((val & mask) == network) return true;
+            }
+            return false;
+        }
         
         private static IPAddress? _optimalIp;
         private static long _optimalLatency = -1;

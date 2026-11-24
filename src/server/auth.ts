@@ -4,7 +4,7 @@ import type { AppDatabase } from "./db";
 import { getSetting } from "./db";
 import { getRuntimeEnv } from "./env";
 import { AppError } from "./errors";
-import { randomToken, secureEqual, sha256 } from "./security";
+import { ipMatchesCidr, randomToken, secureEqual, sha256 } from "./security";
 
 export const SESSION_COOKIE = "apuspay_session";
 export const CSRF_COOKIE = "apuspay_csrf";
@@ -50,10 +50,36 @@ export function attachSocketIp(request: Request, ip: string | undefined) {
   if (ip) socketIps.set(request, ip);
 }
 
+export function getAttachedSocketIp(request: Request): string | undefined {
+  return socketIps.get(request);
+}
+
+const DEFAULT_TRUSTED_PROXY_CIDRS = [
+  "127.0.0.0/8",
+  "10.0.0.0/8",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+  "100.64.0.0/10",
+  "169.254.0.0/16",
+  "::1/128",
+  "fc00::/7",
+  "fe80::/10",
+];
+
+export function isTrustedProxyPeer(peerIp: string): boolean {
+  const env = getRuntimeEnv();
+  if (!env.trustProxy) return false;
+  const trimmed = peerIp.trim();
+  if (!trimmed) return true;
+  const rules = env.trustedProxyCidrs.length > 0 ? env.trustedProxyCidrs : DEFAULT_TRUSTED_PROXY_CIDRS;
+  return rules.some((rule) => ipMatchesCidr(trimmed, rule));
+}
+
 export function clientIp(headers: Headers, rawRequest?: Request) {
   const peerIp = (rawRequest ? socketIps.get(rawRequest) : undefined) ?? "";
-  if (getRuntimeEnv().trustProxy) {
-    const trustCloudflare = process.env.TRUST_CLOUDFLARE === "1" || process.env.TRUST_CLOUDFLARE?.toLowerCase() === "true";
+  const env = getRuntimeEnv();
+  if (isTrustedProxyPeer(peerIp)) {
+    const trustCloudflare = env.trustCloudflare;
     const cfIp = trustCloudflare ? headers.get("cf-connecting-ip")?.trim() : null;
     const xff = headers.get("x-forwarded-for");
     const forwardedIp = xff
@@ -69,18 +95,56 @@ export function setupCompleted(database: AppDatabase) {
   return Boolean(database.query("SELECT 1 FROM admin_users LIMIT 1").get()) && getSetting(database, "setup_completed", false);
 }
 
-export function assertOriginAllowed(requestUrl: string, originOrReferer: string | undefined, database: AppDatabase) {
-  if (!originOrReferer) return;
+export function effectiveRequestOrigin(requestUrl: string, headers?: Headers, rawRequest?: Request): string {
+  const parsed = new URL(requestUrl);
+  const peerIp = (rawRequest ? socketIps.get(rawRequest) : undefined) ?? "";
+  if (headers && isTrustedProxyPeer(peerIp)) {
+    const proto = headers.get("x-forwarded-proto")?.split(",")[0]?.trim().toLowerCase();
+    if (proto === "https" || proto === "http") {
+      parsed.protocol = `${proto}:`;
+    }
+    const xfHost = headers.get("x-forwarded-host")?.split(",")[0]?.trim();
+    if (xfHost && /^[A-Za-z0-9._:\-\[\]]+$/.test(xfHost)) {
+      try {
+        const candidate = new URL(`${parsed.protocol}//${xfHost}`);
+        if (!candidate.username && !candidate.password) {
+          parsed.host = candidate.host;
+        }
+      } catch {
+        // Ignore invalid forwarded host
+      }
+    }
+  }
+  return parsed.origin;
+}
+
+export function assertOriginAllowed(
+  requestUrl: string,
+  originOrReferer: string | undefined,
+  database: AppDatabase,
+  options?: { headers?: Headers; rawRequest?: Request; requireOriginInProd?: boolean },
+) {
+  if (!originOrReferer) {
+    if (options?.requireOriginInProd && getRuntimeEnv().nodeEnv === "production") {
+      throw new AppError(403, "ORIGIN_REQUIRED", "请求缺少受信任的 Origin 或 Referer 头");
+    }
+    return;
+  }
   let origin = originOrReferer;
   try {
     origin = new URL(originOrReferer).origin;
   } catch {
     throw new AppError(403, "ORIGIN_REJECTED", "请求来源格式无效");
   }
-  const allowed = new Set<string>([new URL(requestUrl).origin]);
+  const allowed = new Set<string>([
+    new URL(requestUrl).origin,
+    effectiveRequestOrigin(requestUrl, options?.headers, options?.rawRequest),
+  ]);
   try {
     const configured = getSetting(database, "public_base_url", "");
-    if (configured) allowed.add(new URL(configured).origin);
+    if (configured && (setupCompleted(database) || configured !== "https://pay.example.com")) {
+      allowed.add(new URL(configured).origin);
+    }
   } catch {
     // An invalid configured public URL is handled by settings validation.
   }
@@ -153,12 +217,22 @@ export function createSession(database: AppDatabase, userId: string, headers: He
   return { token, csrf, expires };
 }
 
-export function setAuthCookies(c: Parameters<typeof setCookie>[0], session: ReturnType<typeof createSession>) {
-  const reqUrl = (c as { req?: { url?: string } }).req?.url ?? "";
-  const forwardedProto = getRuntimeEnv().trustProxy
-    ? ((c as { req?: { header?: (n: string) => string | undefined } }).req?.header?.("x-forwarded-proto") ?? "")
+export function setAuthCookies(
+  c: Parameters<typeof setCookie>[0],
+  session: ReturnType<typeof createSession>,
+  database?: AppDatabase,
+) {
+  const reqObj = (c as { req?: { url?: string; raw?: Request; header?: (n: string) => string | undefined } }).req;
+  const reqUrl = reqObj?.url ?? "";
+  const peerIp = (reqObj?.raw ? socketIps.get(reqObj.raw) : undefined) ?? "";
+  const forwardedProto = isTrustedProxyPeer(peerIp)
+    ? (reqObj?.header?.("x-forwarded-proto") ?? "")
     : "";
-  const isHttps = reqUrl.startsWith("https://") || forwardedProto.split(",")[0]?.trim().toLowerCase() === "https";
+  const configuredPublicUrl = database ? getSetting(database, "public_base_url", "") : getRuntimeEnv().publicBaseUrl;
+  const isHttps =
+    reqUrl.startsWith("https://") ||
+    forwardedProto.split(",")[0]?.trim().toLowerCase() === "https" ||
+    configuredPublicUrl.startsWith("https://");
   const secure = getRuntimeEnv().nodeEnv === "production" ? isHttps : false;
   setCookie(c, SESSION_COOKIE, session.token, {
     httpOnly: true,
@@ -204,7 +278,11 @@ export function authMiddleware(database: AppDatabase): MiddlewareHandler<{ Varia
     if (!row) throw new AppError(401, "SESSION_EXPIRED", "登录已过期，请重新登录");
 
     if (!["GET", "HEAD", "OPTIONS"].includes(c.req.method)) {
-      assertOriginAllowed(c.req.url, c.req.header("origin") || c.req.header("referer"), database);
+      assertOriginAllowed(c.req.url, c.req.header("origin") || c.req.header("referer"), database, {
+        headers: c.req.raw.headers,
+        rawRequest: c.req.raw,
+        requireOriginInProd: true,
+      });
       const csrfHeader = c.req.header("x-csrf-token") ?? "";
       const csrfCookie = getCookie(c, CSRF_COOKIE) ?? getCookie(c, "alimpay_csrf") ?? "";
       const cookieMatches = Boolean(csrfHeader && csrfCookie && secureEqual(csrfHeader, csrfCookie));

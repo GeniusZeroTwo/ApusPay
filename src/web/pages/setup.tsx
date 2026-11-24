@@ -11,9 +11,10 @@ import { Loading } from "@/web/components/ui/loading";
 
 export function SetupPage() {
   const navigate = useNavigate();
-  const { data, isLoading } = useSWR<{ setup_completed: boolean }>("/admin-api/setup/status", swrFetcher);
+  const { data, isLoading } = useSWR<{ setup_completed: boolean; setup_token_required?: boolean }>("/admin-api/setup/status", swrFetcher);
   const [password, setPassword] = useState("");
   const [confirmation, setConfirmation] = useState("");
+  const [setupToken, setSetupToken] = useState("");
   const [baseUrl, setBaseUrl] = useState(window.location.origin);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -30,7 +31,14 @@ export function SetupPage() {
     }
     setSubmitting(true);
     try {
-      await apiFetch("/admin-api/setup", { method: "POST", ...jsonBody({ password, public_base_url: baseUrl }) });
+      await apiFetch("/admin-api/setup", {
+        method: "POST",
+        ...jsonBody({
+          password,
+          public_base_url: baseUrl,
+          ...(setupToken.trim() ? { setup_token: setupToken.trim() } : {}),
+        }),
+      });
       const me = await apiFetch<{ user: { username: string } }>("/admin-api/me");
       await mutate("/admin-api/setup/status", { setup_completed: true }, { revalidate: false });
       await mutate("/admin-api/me", me, { revalidate: false });
@@ -82,13 +90,27 @@ export function SetupPage() {
                 <Input id="base-url" type="url" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} required />
                 <p className="text-xs leading-5 text-muted">用于生成收银台、经营码图片和商户 API 返回地址。</p>
               </div>
+              {data?.setup_token_required ? (
+                <div className="space-y-2">
+                  <Label htmlFor="setup-token">初始化安全令牌</Label>
+                  <Input
+                    id="setup-token"
+                    type="password"
+                    value={setupToken}
+                    onChange={(event) => setSetupToken(event.target.value)}
+                    placeholder="填写 SETUP_TOKEN 或 data/.setup-token 内容"
+                    required
+                  />
+                  <p className="text-xs leading-5 text-muted">生产环境首次部署需验证一次性安装令牌（见服务器 data/.setup-token）。</p>
+                </div>
+              ) : null}
               <div className="space-y-2">
                 <Label htmlFor="password">管理员密码</Label>
                 <Input id="password" type="password" minLength={12} maxLength={128} value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="new-password" required />
               </div>
               <div className="space-y-2">
                 <Label htmlFor="confirmation">确认密码</Label>
-                <Input id="confirmation" type="password" minLength={12} value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="new-password" required />
+                <Input id="confirmation" type="password" minLength={12} maxLength={128} value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="new-password" required />
               </div>
               {error ? <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive" role="alert">{error}</div> : null}
               <Button className="w-full" size="lg" disabled={submitting}>

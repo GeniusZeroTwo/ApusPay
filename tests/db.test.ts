@@ -50,4 +50,45 @@ describe("database settings migrations", () => {
     opened.push(database);
     expect(getSetting(database, "transfer_link_layer", 0)).toBe(2);
   });
+
+  it("adds wxpay_transaction_id unique index and per-channel amount_reservations on legacy v3 databases", () => {
+    directory = mkdtempSync(join(tmpdir(), "apuspay-db-v6-"));
+    const path = join(directory, "legacy-v3.sqlite");
+    const raw = new Database(path);
+    raw.exec(`
+      CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+      CREATE TABLE admin_users (id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, expires_at TEXT NOT NULL, created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, ip TEXT NOT NULL DEFAULT '', user_agent TEXT NOT NULL DEFAULT '');
+      CREATE TABLE settings (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, is_secret INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);
+      CREATE TABLE orders (
+        id TEXT PRIMARY KEY, trade_no TEXT NOT NULL UNIQUE, pid TEXT NOT NULL, api_version TEXT NOT NULL,
+        out_trade_no TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'alipay', name TEXT NOT NULL,
+        requested_amount_cents INTEGER NOT NULL, payable_amount_cents INTEGER NOT NULL, collection_mode TEXT NOT NULL,
+        notify_url TEXT NOT NULL, return_url TEXT, param TEXT NOT NULL DEFAULT '', client_ip TEXT NOT NULL DEFAULT '',
+        checkout_token TEXT NOT NULL UNIQUE, status TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+        monitor_until TEXT NOT NULL, paid_at TEXT, alipay_account_log_id TEXT UNIQUE, alipay_order_no TEXT,
+        wxpay_transaction_id TEXT, channel_order_id TEXT, channel_qr_payload TEXT, buyer TEXT NOT NULL DEFAULT '',
+        raw_request_json TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE TABLE amount_reservations (
+        id TEXT PRIMARY KEY, order_id TEXT NOT NULL UNIQUE, amount_cents INTEGER NOT NULL UNIQUE,
+        reserved_until TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE TABLE notification_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, attempt_number INTEGER NOT NULL, requested_at TEXT NOT NULL);
+    `);
+    const now = new Date().toISOString();
+    for (const v of [1, 2, 3]) {
+      raw.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(v, now);
+    }
+    raw.close();
+
+    const upgraded = createDatabase(path);
+    opened.push(upgraded);
+    const indexes = upgraded.query("PRAGMA index_list(orders)").all() as Array<{ name: string; unique: number }>;
+    expect(indexes.some((idx) => idx.name === "idx_orders_wxpay_tx_unique" && idx.unique === 1)).toBe(true);
+    const orderCols = (upgraded.query("PRAGMA table_info(orders)").all() as Array<{ name: string }>).map((c) => c.name);
+    expect(orderCols).toContain("upstream_closed_at");
+    const resCols = (upgraded.query("PRAGMA table_info(amount_reservations)").all() as Array<{ name: string }>).map((c) => c.name);
+    expect(resCols).toContain("channel");
+  });
 });

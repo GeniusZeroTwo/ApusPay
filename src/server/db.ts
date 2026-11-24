@@ -1,3 +1,4 @@
+import { chmodSync } from "node:fs";
 import { Database, type SQLQueryBindings } from "bun:sqlite";
 import { PAYMENT_POLL_INTERVAL_DEFAULT_SECONDS } from "../shared/contracts";
 import { getRuntimeEnv } from "./env";
@@ -65,6 +66,7 @@ CREATE TABLE IF NOT EXISTS orders (
   wxpay_transaction_id TEXT UNIQUE,
   channel_order_id TEXT,
   channel_qr_payload TEXT,
+  upstream_closed_at TEXT,
   buyer TEXT NOT NULL DEFAULT '',
   raw_request_json TEXT NOT NULL DEFAULT '{}',
   UNIQUE(pid, out_trade_no)
@@ -74,15 +76,18 @@ CREATE INDEX IF NOT EXISTS idx_orders_status_created ON orders(status, created_a
 CREATE INDEX IF NOT EXISTS idx_orders_status_expires ON orders(status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_orders_hook_match ON orders(type, collection_mode, status, payable_amount_cents, monitor_until);
 CREATE INDEX IF NOT EXISTS idx_orders_wxpay_trade ON orders(type, trade_no);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_wxpay_tx_unique ON orders(wxpay_transaction_id) WHERE wxpay_transaction_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_orders_out_trade_no ON orders(out_trade_no);
 
 CREATE TABLE IF NOT EXISTS amount_reservations (
   id TEXT PRIMARY KEY,
-  order_id TEXT NOT NULL UNIQUE REFERENCES orders(id) ON DELETE CASCADE,
-  amount_cents INTEGER NOT NULL UNIQUE,
+  order_id TEXT UNIQUE REFERENCES orders(id) ON DELETE SET NULL,
+  channel TEXT NOT NULL DEFAULT 'alipay',
+  amount_cents INTEGER NOT NULL,
   reserved_until TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  UNIQUE(channel, amount_cents)
 );
 CREATE INDEX IF NOT EXISTS idx_amount_reservations_until ON amount_reservations(reserved_until);
 
@@ -190,6 +195,15 @@ const DEFAULT_SETTINGS: Record<string, unknown> = {
 export function createDatabase(path = getRuntimeEnv().databasePath): AppDatabase {
   const database = new Database(path, { create: true, strict: true });
   database.exec("PRAGMA journal_mode = WAL;");
+  if (path !== ":memory:" && !path.startsWith("file:")) {
+    for (const dbFile of [path, `${path}-wal`, `${path}-shm`]) {
+      try {
+        chmodSync(dbFile, 0o600);
+      } catch {
+        // Ignore missing WAL/SHM before first write
+      }
+    }
+  }
   database.exec("PRAGMA foreign_keys = ON;");
   database.exec("PRAGMA busy_timeout = 5000;");
   database.exec("PRAGMA synchronous = NORMAL;");
@@ -283,10 +297,67 @@ export function createDatabase(path = getRuntimeEnv().databasePath): AppDatabase
     }
   }
 
+  const channelIsolationMigration = database.query("SELECT 1 FROM schema_migrations WHERE version = 6").get();
+  if (!channelIsolationMigration) {
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      const orderColumns = (database.query("PRAGMA table_info(orders)").all() as Array<{ name: string }>).map((c) => c.name);
+      if (!orderColumns.includes("upstream_closed_at")) {
+        database.exec("ALTER TABLE orders ADD COLUMN upstream_closed_at TEXT;");
+      }
+      database.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_wxpay_tx_unique
+        ON orders(wxpay_transaction_id) WHERE wxpay_transaction_id IS NOT NULL;
+      `);
+
+      const resColumns = (database.query("PRAGMA table_info(amount_reservations)").all() as Array<{ name: string }>).map((c) => c.name);
+      if (!resColumns.includes("channel")) {
+        database.exec(`
+          CREATE TABLE amount_reservations_v6 (
+            id TEXT PRIMARY KEY,
+            order_id TEXT UNIQUE REFERENCES orders(id) ON DELETE SET NULL,
+            channel TEXT NOT NULL DEFAULT 'alipay',
+            amount_cents INTEGER NOT NULL,
+            reserved_until TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(channel, amount_cents)
+          );
+          INSERT OR IGNORE INTO amount_reservations_v6(id, order_id, channel, amount_cents, reserved_until, created_at)
+          SELECT
+            ar.id,
+            ar.order_id,
+            COALESCE((SELECT o.type FROM orders o WHERE o.id = ar.order_id), 'alipay'),
+            ar.amount_cents,
+            ar.reserved_until,
+            ar.created_at
+          FROM amount_reservations ar;
+          DROP TABLE amount_reservations;
+          ALTER TABLE amount_reservations_v6 RENAME TO amount_reservations;
+          CREATE INDEX IF NOT EXISTS idx_amount_reservations_until ON amount_reservations(reserved_until);
+        `);
+      }
+
+      database.query("INSERT INTO schema_migrations(version, applied_at) VALUES (6, ?)").run(now);
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   const insert = database.query("INSERT OR IGNORE INTO settings(key, value_json, is_secret, updated_at) VALUES (?, ?, 0, ?)");
   for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) insert.run(key, JSON.stringify(value), now);
-  if (!getSetting<string>(database, "public_base_url", "")) {
-    setSetting(database, "public_base_url", getRuntimeEnv().publicBaseUrl);
+  const isSetupDone = Boolean(database.query("SELECT 1 FROM admin_users LIMIT 1").get()) && getSetting(database, "setup_completed", false);
+  const existingPublicUrl = getSetting<string>(database, "public_base_url", "");
+  const envPublicUrl = getRuntimeEnv().publicBaseUrl;
+  if (!isSetupDone) {
+    if (envPublicUrl && envPublicUrl !== "https://pay.example.com") {
+      setSetting(database, "public_base_url", envPublicUrl);
+    } else if (existingPublicUrl === "https://pay.example.com") {
+      setSetting(database, "public_base_url", "");
+    }
+  } else if (!existingPublicUrl && envPublicUrl && envPublicUrl !== "https://pay.example.com") {
+    setSetting(database, "public_base_url", envPublicUrl);
   }
   return database;
 }
@@ -341,6 +412,26 @@ export function setSetting(database: AppDatabase, key: string, value: unknown, i
   `).run(key, JSON.stringify(value), isSecret ? 1 : 0, new Date().toISOString());
   // Invalidate rather than eagerly populating so any transaction ROLLBACK stays consistent.
   settingsCache.get(database)?.delete(key);
+}
+
+export function clearSettingsCache(database: AppDatabase) {
+  settingsCache.delete(database);
+}
+
+export function withTransaction<T>(database: AppDatabase, fn: () => T): T {
+  if (database.inTransaction) {
+    return fn();
+  }
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const result = fn();
+    database.exec("COMMIT");
+    return result;
+  } catch (error) {
+    database.exec("ROLLBACK");
+    settingsCache.delete(database);
+    throw error;
+  }
 }
 
 export function queryAll<T>(database: AppDatabase, sql: string, ...bindings: SQLQueryBindings[]) {

@@ -43,6 +43,7 @@ export interface OrderRecord {
   wxpay_transaction_id: string | null;
   channel_order_id: string | null;
   channel_qr_payload: string | null;
+  upstream_closed_at?: string | null;
   buyer: string;
 }
 

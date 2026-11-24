@@ -140,8 +140,8 @@ export function SystemPage() {
       </Card>
 
       <Card className="mt-6 max-w-2xl">
-        <CardHeader><CardTitle>修改管理员密码</CardTitle><CardDescription>新密码至少 12 位；修改后当前会话保持有效。</CardDescription></CardHeader>
-        <CardContent><form className="space-y-4" onSubmit={changePassword}><div className="space-y-2"><Label htmlFor="current-password">当前密码</Label><Input id="current-password" type="password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} required /></div><div className="space-y-2"><Label htmlFor="new-password">新密码</Label><Input id="new-password" type="password" minLength={12} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} required /></div><Button>更新密码</Button></form></CardContent>
+        <CardHeader><CardTitle>修改管理员密码</CardTitle><CardDescription>新密码须为 12–128 位；修改后当前会话保持有效。</CardDescription></CardHeader>
+        <CardContent><form className="space-y-4" onSubmit={changePassword}><div className="space-y-2"><Label htmlFor="current-password">当前密码</Label><Input id="current-password" type="password" maxLength={128} value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} required /></div><div className="space-y-2"><Label htmlFor="new-password">新密码</Label><Input id="new-password" type="password" minLength={12} maxLength={128} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} required /></div><Button>更新密码</Button></form></CardContent>
       </Card>
     </>
   );

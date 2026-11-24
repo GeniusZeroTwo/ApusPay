@@ -12,6 +12,7 @@
     <FileVersion>1.0.0</FileVersion>
     <RepositoryUrl>https://github.com/GeniusZeroTwo/ApusPay</RepositoryUrl>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
   </PropertyGroup>
 
   <ItemGroup>

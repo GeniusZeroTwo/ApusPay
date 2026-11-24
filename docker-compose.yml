@@ -11,9 +11,12 @@ services:
       HOST: 0.0.0.0
       PORT: 3000
       DATA_DIR: /data
-      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://pay.example.com}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      SETUP_TOKEN: ${SETUP_TOKEN:-}
       APP_MASTER_KEY: ${APP_MASTER_KEY:-}
       TRUST_PROXY: ${TRUST_PROXY:-true}
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
+      TRUST_CLOUDFLARE: ${TRUST_CLOUDFLARE:-false}
       ALLOW_PRIVATE_CALLBACKS: ${ALLOW_PRIVATE_CALLBACKS:-false}
       ALLOWED_CALLBACK_HOSTS: ${ALLOWED_CALLBACK_HOSTS:-}
     volumes:
@@ -22,8 +25,8 @@ services:
       - 8.8.8.8
       - 1.1.1.1
     networks:
-      - 1panel-network
+      - apuspay-net
 
 networks:
-  1panel-network:
-    external: true
+  apuspay-net:
+    driver: bridge

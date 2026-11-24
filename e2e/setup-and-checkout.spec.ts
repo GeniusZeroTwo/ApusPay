@@ -54,19 +54,22 @@ test("first-run setup, key generation, QR upload and public checkout", async ({ 
   await expect(page.getByText("商户公钥已导入")).toBeVisible();
 
   await page.getByRole("link", { name: "收款配置" }).click();
-  await page.getByLabel("应用 ID").fill("2026000000000000");
-  await page.getByLabel("支付宝公钥").fill(publicKey);
-  await page.getByLabel("支付轮询间隔（秒）").fill("2");
-  await page.getByLabel("经营码图片").setInputFiles({
+  await page.getByRole("button", { name: /经营码账单/ }).click();
+  await page.getByLabel("支付宝应用 ID (AppID)").fill("2026000000000000");
+  await page.getByLabel(/支付宝公钥/).fill(publicKey);
+  await page.getByLabel("上传经营码图片").setInputFiles({
     name: "business-qr.png",
     mimeType: "image/png",
     buffer: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"),
   });
-  await expect(page.getByText("已上传", { exact: true })).toBeVisible();
+  await expect(page.getByText("已上传经营码")).toBeVisible();
+  await page.getByRole("button", { name: "网关与易支付协议" }).click();
+  await page.getByLabel("支付轮询间隔 (秒)").fill("2");
   await page.getByRole("button", { name: /保存全部配置/ }).click();
-  await expect(page.getByText("配置已保存")).toBeVisible();
+  await expect(page.getByText("配置已成功保存")).toBeVisible();
   await page.reload();
-  await expect(page.getByLabel("支付轮询间隔（秒）")).toHaveValue("2");
+  await page.getByRole("button", { name: "网关与易支付协议" }).click();
+  await expect(page.getByLabel("支付轮询间隔 (秒)")).toHaveValue("2");
 
   await page.getByRole("link", { name: "密钥中心" }).click();
   await page.getByRole("button", { name: "查看凭据" }).click();
@@ -118,11 +121,10 @@ test("mobile navigation is usable and transfer checkout opens Alipay", async ({ 
 
   await page.getByRole("button", { name: "打开导航" }).click();
   await page.getByRole("dialog").getByRole("link", { name: "收款配置" }).click();
-  await page.getByRole("button", { name: /转账备注/ }).click();
-  await page.getByLabel("支付宝用户 ID").fill("2088000000000000");
-  await page.getByLabel("转账链接包裹层级").selectOption("2");
+  await page.getByRole("button", { name: /转账备注模式/ }).click();
+  await page.getByLabel("收款方支付宝用户 ID").fill("2088000000000000");
   await page.getByRole("button", { name: /保存全部配置/ }).click({ force: true });
-  await expect(page.getByText("配置已保存")).toBeVisible();
+  await expect(page.getByText("配置已成功保存")).toBeVisible();
 
   await page.route("https://render.alipay.com/**", async (route) => {
     await route.fulfill({ contentType: "text/html", body: "<title>Alipay opened</title>" });

@@ -142,6 +142,7 @@ function SettingsForm({ initial, refresh }: { initial: SettingsData; refresh: ()
           }),
         });
         setWxpayPrivateKey("");
+        setWxpayApiV3Key("");
       }
 
       toast.success("配置已成功保存");
@@ -570,7 +571,7 @@ function SettingsForm({ initial, refresh }: { initial: SettingsData; refresh: ()
                   </div>
 
                   <div className="space-y-2">
-                    <Label htmlFor="wx-public-key">微信支付平台公钥 / 证书 (PEM，推荐配置以验签回调请求头)</Label>
+                    <Label htmlFor="wx-public-key">微信支付平台公钥 / 证书 (PEM，必填配置以验签回调请求头)</Label>
                     <Textarea
                       id="wx-public-key"
                       rows={3}

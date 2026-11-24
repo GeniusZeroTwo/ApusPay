@@ -27,9 +27,9 @@ import {
   verifyPassword,
   type AuthVariables,
 } from "./auth";
-import { getPublicSettings, getSecret, isGatewayReady, setSecret } from "./config";
-import { audit, getSetting, setSetting, type AppDatabase } from "./db";
-import { getRuntimeEnv } from "./env";
+import { clearSecretCache, getPublicSettings, getSecret, isGatewayReady, setSecret } from "./config";
+import { audit, getSetting, setSetting, withTransaction, type AppDatabase } from "./db";
+import { consumeSetupToken, getRuntimeEnv } from "./env";
 import { AppError, assert } from "./errors";
 import { notificationHistory, queueManualNotification } from "./notifications";
 import { getOrderById, listOrders, markOrderPaidDirectly } from "./orders";
@@ -38,7 +38,9 @@ import {
   parseBoundedInt,
   randomAlphaNumeric,
   randomMerchantPid,
+  secureEqual,
   sha256,
+  validateCallbackUrl,
   validatePrivateKey,
   validatePublicKey,
   toPkcs8PrivateKey,
@@ -47,13 +49,19 @@ import {
 import { WeChatPayService } from "./wechat";
 
 const setupSchema = z.object({
-  password: z.string().min(12, "密码至少 12 位").max(128),
+  password: z.string().min(12, "密码至少 12 位").max(128, "密码不能超过 128 位"),
   public_base_url: z.string().min(1),
+  setup_token: z.string().max(256).optional(),
 });
 
 const loginSchema = z.object({
   username: z.string().default("admin"),
   password: z.string().min(1).max(128),
+});
+
+const passwordChangeSchema = z.object({
+  current_password: z.string().min(1, "必须填写当前密码").max(128, "密码不能超过 128 位"),
+  new_password: z.string().min(12, "新密码至少 12 位").max(128, "新密码不能超过 128 位"),
 });
 
 function validatePublicBaseUrl(value: string) {
@@ -124,14 +132,38 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
   const app = new Hono<{ Variables: AuthVariables }>();
   const wechatService = new WeChatPayService(database);
 
-  app.get("/setup/status", (c) => c.json({ setup_completed: setupCompleted(database) }));
+  app.get("/setup/status", (c) => {
+    const completed = setupCompleted(database);
+    return c.json({
+      setup_completed: completed,
+      setup_token_required: !completed && Boolean(getRuntimeEnv().setupToken),
+    });
+  });
 
   app.post("/setup", async (c) => {
-    assertOriginAllowed(c.req.url, c.req.header("origin") || c.req.header("referer"), database);
+    assertOriginAllowed(c.req.url, c.req.header("origin") || c.req.header("referer"), database, {
+      headers: c.req.raw.headers,
+      rawRequest: c.req.raw,
+      requireOriginInProd: true,
+    });
     if (setupCompleted(database)) throw new AppError(400, "ALREADY_SETUP", "初始设置已完成");
     const json = await c.req.json().catch(() => ({}));
     const parsed = setupSchema.safeParse(json);
     if (!parsed.success) throw new AppError(400, "VALIDATION_FAILED", parsed.error.issues[0]?.message ?? "参数错误");
+
+    const requiredSetupToken = getRuntimeEnv().setupToken;
+    if (requiredSetupToken) {
+      const providedToken = (parsed.data.setup_token ?? c.req.header("x-setup-token") ?? "").trim();
+      const ip = clientIp(c.req.raw.headers, c.req.raw) || "unknown";
+      const setupRateKey = `setup:${ip}`;
+      checkLoginRateLimit(setupRateKey);
+      if (!providedToken || !secureEqual(providedToken, requiredSetupToken)) {
+        recordLoginFailure(setupRateKey);
+        throw new AppError(403, "SETUP_TOKEN_INVALID", "首次安装安全令牌无效或缺失，请核对 SETUP_TOKEN 或 data/.setup-token");
+      }
+      clearLoginFailures(setupRateKey);
+    }
+
     const url = validatePublicBaseUrl(parsed.data.public_base_url);
 
     // Run CPU-intensive Argon2id & 3x RSA-2048 keygens outside the SQLite write lock
@@ -167,16 +199,22 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
       const session = createSession(database, userId, c.req.raw.headers, c.req.raw);
       audit(database, "setup.completed", { actor: "admin", ip: clientIp(c.req.raw.headers, c.req.raw) });
       database.exec("COMMIT");
-      setAuthCookies(c, session);
+      consumeSetupToken();
+      setAuthCookies(c, session, database);
       return c.json({ ok: true, csrf_token: session.csrf });
     } catch (error) {
       database.exec("ROLLBACK");
+      clearSecretCache(database);
       throw error;
     }
   });
 
   const handleLogin = async (c: any) => {
-    assertOriginAllowed(c.req.url, c.req.header("origin") || c.req.header("referer"), database);
+    assertOriginAllowed(c.req.url, c.req.header("origin") || c.req.header("referer"), database, {
+      headers: c.req.raw.headers,
+      rawRequest: c.req.raw,
+      requireOriginInProd: true,
+    });
     const ip = clientIp(c.req.raw.headers, c.req.raw);
     const json = await c.req.json().catch(() => ({}));
     const parsed = loginSchema.safeParse(json);
@@ -202,7 +240,7 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
     clearLoginFailures(accountRateKey);
     if (ip) clearLoginFailures(`ip:${ip}`);
     const session = createSession(database, user.id, c.req.raw.headers, c.req.raw);
-    setAuthCookies(c, session);
+    setAuthCookies(c, session, database);
     audit(database, "auth.login_success", { actor: user.username, ip });
     return c.json({
       ok: true,
@@ -216,7 +254,11 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
   app.post("/auth/login", handleLogin);
 
   const handleLogout = (c: any) => {
-    assertOriginAllowed(c.req.url, c.req.header("origin") || c.req.header("referer"), database);
+    assertOriginAllowed(c.req.url, c.req.header("origin") || c.req.header("referer"), database, {
+      headers: c.req.raw.headers,
+      rawRequest: c.req.raw,
+      requireOriginInProd: true,
+    });
     const token = getCookie(c, SESSION_COOKIE) ?? getCookie(c, "alimpay_session");
     if (token) database.query("DELETE FROM sessions WHERE token_hash = ?").run(sha256(token));
     clearAuthCookies(c);
@@ -319,11 +361,12 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
     const order = getOrderById(database, c.req.param("id"));
     assert(order, 404, "ORDER_NOT_FOUND", "订单不存在");
     const actor = c.get("admin").username;
-    markOrderPaidDirectly(database, order.id, {
+    const marked = markOrderPaidDirectly(database, order.id, {
       channel: order.type,
-      channelOrderId: `MANUAL-${Date.now()}`,
+      channelOrderId: `MANUAL-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`,
       buyer: `admin:${actor}`,
     });
+    assert(marked, 409, "ORDER_ALREADY_PAID", "订单已支付或状态不允许重复标记");
     audit(database, "order.manual_mark_paid", {
       actor,
       targetType: "order",
@@ -332,6 +375,14 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
       details: { trade_no: order.trade_no, out_trade_no: order.out_trade_no },
     });
     return c.json({ ok: true });
+  });
+
+  app.post("/orders/:id/sync", async (c) => {
+    const order = getOrderById(database, c.req.param("id"));
+    assert(order, 404, "ORDER_NOT_FOUND", "订单不存在");
+    const matched = await scanner.syncOrder(order);
+    const updated = getOrderById(database, order.id);
+    return c.json({ ok: true, matched, status: updated?.status ?? order.status });
   });
 
   app.post("/scans/run", async (c) => {
@@ -361,19 +412,47 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
     const body = await c.req.json<Record<string, unknown>>().catch(() => ({} as Record<string, unknown>));
     const allowed = new Set([
       "public_base_url", "collection_mode", "transfer_user_id",
-      "alipay_enabled", "alipay_mode", "alipay_app_id", "alipay_endpoint", "alipay_public_key",
+      "alipay_enabled", "alipay_mode", "alipay_app_id", "alipay_endpoint", "alipay_public_key", "alipay_hook_enabled",
       "wxpay_enabled", "wxpay_mode", "wxpay_app_id", "wxpay_mch_id", "wxpay_serial_no", "wxpay_public_key", "wxpay_static_qr_url",
-      "wxpay_hook_token",
+      "wxpay_hook_token", "hook_require_event_id",
       "transfer_link_layer", "payment_poll_interval_seconds", "v1_enabled", "v2_enabled", "business_qr_raw",
     ]);
     for (const key of Object.keys(body)) {
       if (!allowed.has(key)) throw new AppError(400, "UNKNOWN_SETTING", `不支持设置项 ${key}`);
     }
 
-    if (typeof body.public_base_url === "string") setSetting(database, "public_base_url", validatePublicBaseUrl(body.public_base_url));
-    if (typeof body.alipay_enabled === "boolean") setSetting(database, "alipay_enabled", body.alipay_enabled);
-    if (["f2f", "bill", "transfer"].includes(String(body.alipay_mode))) setSetting(database, "alipay_mode", body.alipay_mode);
-    if (typeof body.alipay_app_id === "string") setSetting(database, "alipay_app_id", body.alipay_app_id.trim());
+    // Phase 1: Validate and normalize all fields in memory BEFORE modifying SQLite
+    const pendingMutations: Array<() => void> = [];
+
+    if (typeof body.public_base_url === "string") {
+      const validatedBaseUrl = validatePublicBaseUrl(body.public_base_url);
+      pendingMutations.push(() => setSetting(database, "public_base_url", validatedBaseUrl));
+    }
+    if (typeof body.alipay_enabled === "boolean") {
+      const enabled = body.alipay_enabled;
+      pendingMutations.push(() => setSetting(database, "alipay_enabled", enabled));
+    }
+    if (typeof body.alipay_hook_enabled === "boolean") {
+      const hookEnabled = body.alipay_hook_enabled;
+      pendingMutations.push(() => setSetting(database, "alipay_hook_enabled", hookEnabled));
+    }
+    if (typeof body.hook_require_event_id === "boolean") {
+      const requireEventId = body.hook_require_event_id;
+      pendingMutations.push(() => setSetting(database, "hook_require_event_id", requireEventId));
+    }
+    if (body.alipay_mode !== undefined) {
+      assert(["f2f", "bill", "transfer"].includes(String(body.alipay_mode)), 400, "INVALID_ALIPAY_MODE", "无效的支付宝收款模式");
+      const mode = String(body.alipay_mode) as "f2f" | "bill" | "transfer";
+      const mappedCollection = mode === "f2f" ? "alipay_f2f" : mode === "bill" ? "business_qr" : "transfer";
+      pendingMutations.push(() => {
+        setSetting(database, "alipay_mode", mode);
+        setSetting(database, "collection_mode", mappedCollection);
+      });
+    }
+    if (typeof body.alipay_app_id === "string") {
+      const appId = body.alipay_app_id.trim();
+      pendingMutations.push(() => setSetting(database, "alipay_app_id", appId));
+    }
     if (typeof body.alipay_endpoint === "string") {
       let endpoint: URL;
       try {
@@ -382,40 +461,84 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
         throw new AppError(400, "INVALID_ALIPAY_ENDPOINT", "支付宝网关地址格式无效");
       }
       assert(endpoint.protocol === "https:", 400, "INVALID_ALIPAY_ENDPOINT", "支付宝网关必须使用 HTTPS");
-      setSetting(database, "alipay_endpoint", endpoint.toString().replace(/\/$/, ""));
+      validateCallbackUrl(
+        endpoint.toString(),
+        getRuntimeEnv().allowPrivateCallbacks,
+        getRuntimeEnv().allowedCallbackHosts,
+      );
+      const cleanEndpoint = endpoint.toString().replace(/\/$/, "");
+      pendingMutations.push(() => setSetting(database, "alipay_endpoint", cleanEndpoint));
     }
     if (typeof body.alipay_public_key === "string") {
-      if (body.alipay_public_key) validatePublicKey(body.alipay_public_key);
-      setSetting(database, "alipay_public_key", body.alipay_public_key ? toSpkiPublicKey(body.alipay_public_key) : "");
+      const trimmedPub = body.alipay_public_key.trim();
+      const spki = trimmedPub ? (validatePublicKey(trimmedPub), toSpkiPublicKey(trimmedPub)) : "";
+      pendingMutations.push(() => setSetting(database, "alipay_public_key", spki));
     }
-    if (typeof body.business_qr_raw === "string") setSetting(database, "business_qr_raw", body.business_qr_raw.trim());
+    if (typeof body.business_qr_raw === "string") {
+      const rawQr = body.business_qr_raw.trim();
+      pendingMutations.push(() => setSetting(database, "business_qr_raw", rawQr));
+    }
 
-    if (typeof body.wxpay_enabled === "boolean") setSetting(database, "wxpay_enabled", body.wxpay_enabled);
-    if (["native", "hook"].includes(String(body.wxpay_mode))) setSetting(database, "wxpay_mode", body.wxpay_mode);
-    if (typeof body.wxpay_app_id === "string") setSetting(database, "wxpay_app_id", body.wxpay_app_id.trim());
-    if (typeof body.wxpay_mch_id === "string") setSetting(database, "wxpay_mch_id", body.wxpay_mch_id.trim());
-    if (typeof body.wxpay_serial_no === "string") setSetting(database, "wxpay_serial_no", body.wxpay_serial_no.trim());
+    if (typeof body.wxpay_enabled === "boolean") {
+      const enabled = body.wxpay_enabled;
+      pendingMutations.push(() => setSetting(database, "wxpay_enabled", enabled));
+    }
+    if (body.wxpay_mode !== undefined) {
+      assert(["native", "hook"].includes(String(body.wxpay_mode)), 400, "INVALID_WXPAY_MODE", "无效的微信收款模式");
+      const wxMode = String(body.wxpay_mode);
+      pendingMutations.push(() => setSetting(database, "wxpay_mode", wxMode));
+    }
+    if (typeof body.wxpay_app_id === "string") {
+      const wxAppId = body.wxpay_app_id.trim();
+      pendingMutations.push(() => setSetting(database, "wxpay_app_id", wxAppId));
+    }
+    if (typeof body.wxpay_mch_id === "string") {
+      const wxMchId = body.wxpay_mch_id.trim();
+      pendingMutations.push(() => setSetting(database, "wxpay_mch_id", wxMchId));
+    }
+    if (typeof body.wxpay_serial_no === "string") {
+      const wxSerial = body.wxpay_serial_no.trim();
+      pendingMutations.push(() => setSetting(database, "wxpay_serial_no", wxSerial));
+    }
     if (typeof body.wxpay_public_key === "string") {
       const trimmedPub = body.wxpay_public_key.trim();
-      if (trimmedPub) validatePublicKey(trimmedPub);
-      setSetting(database, "wxpay_public_key", trimmedPub ? toSpkiPublicKey(trimmedPub) : "");
+      const spki = trimmedPub ? (validatePublicKey(trimmedPub), toSpkiPublicKey(trimmedPub)) : "";
+      pendingMutations.push(() => setSetting(database, "wxpay_public_key", spki));
     }
     if (typeof body.wxpay_static_qr_url === "string") {
-      setSetting(database, "wxpay_static_qr_url", validateQrImageUrl(body.wxpay_static_qr_url));
+      const validatedQr = validateQrImageUrl(body.wxpay_static_qr_url);
+      pendingMutations.push(() => setSetting(database, "wxpay_static_qr_url", validatedQr));
     }
     if (typeof body.wxpay_hook_token === "string") {
       const trimmedToken = body.wxpay_hook_token.trim();
       if (!trimmedToken) {
-        if (!getSecret(database, "wxpay_hook_token")) {
-          setSecret(database, "wxpay_hook_token", randomAlphaNumeric(32));
-        }
+        pendingMutations.push(() => {
+          if (!getSecret(database, "wxpay_hook_token")) {
+            setSecret(database, "wxpay_hook_token", randomAlphaNumeric(32));
+          }
+        });
       } else {
         assert(trimmedToken.length >= 8, 400, "INVALID_HOOK_TOKEN", "Hook 鉴权 Token 长度至少为 8 位");
-        setSecret(database, "wxpay_hook_token", trimmedToken);
+        pendingMutations.push(() => setSecret(database, "wxpay_hook_token", trimmedToken));
       }
     }
 
-    if (body.collection_mode === "business_qr" || body.collection_mode === "transfer") setSetting(database, "collection_mode", body.collection_mode);
+    if (body.collection_mode !== undefined) {
+      assert(
+        ["alipay_f2f", "business_qr", "transfer", "alipay_bill", "alipay_transfer"].includes(String(body.collection_mode)),
+        400,
+        "INVALID_COLLECTION_MODE",
+        "不支持的收款模式",
+      );
+      const colMode = String(body.collection_mode);
+      const syncedAlipayMode = colMode === "alipay_f2f" ? "f2f" : (colMode === "transfer" || colMode === "alipay_transfer") ? "transfer" : "bill";
+      pendingMutations.push(() => {
+        setSetting(database, "collection_mode", colMode);
+        if (body.alipay_mode === undefined) {
+          setSetting(database, "alipay_mode", syncedAlipayMode);
+        }
+      });
+    }
     if (body.transfer_link_layer !== undefined) {
       assert(
         typeof body.transfer_link_layer === "number" && [1, 2, 3].includes(body.transfer_link_layer),
@@ -423,7 +546,8 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
         "INVALID_TRANSFER_LINK_LAYER",
         "转账链接层级必须为 1–3",
       );
-      setSetting(database, "transfer_link_layer", body.transfer_link_layer);
+      const layer = body.transfer_link_layer;
+      pendingMutations.push(() => setSetting(database, "transfer_link_layer", layer));
     }
     if (body.payment_poll_interval_seconds !== undefined) {
       assert(
@@ -435,16 +559,37 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
         "INVALID_PAYMENT_POLL_INTERVAL",
         `支付轮询间隔必须为 ${PAYMENT_POLL_INTERVAL_MIN_SECONDS}–${PAYMENT_POLL_INTERVAL_MAX_SECONDS} 秒的整数`,
       );
-      setSetting(database, "payment_poll_interval_seconds", body.payment_poll_interval_seconds);
+      const pollInterval = body.payment_poll_interval_seconds;
+      pendingMutations.push(() => setSetting(database, "payment_poll_interval_seconds", pollInterval));
     }
     if (typeof body.transfer_user_id === "string") {
       assert(/^\d{8,32}$/.test(body.transfer_user_id) || body.transfer_user_id === "", 400, "INVALID_TRANSFER_USER", "支付宝用户 ID 应为 8–32 位数字");
-      setSetting(database, "transfer_user_id", body.transfer_user_id);
+      const transferUid = body.transfer_user_id;
+      pendingMutations.push(() => setSetting(database, "transfer_user_id", transferUid));
     }
-    if (typeof body.v1_enabled === "boolean") setSetting(database, "v1_enabled", body.v1_enabled);
-    if (typeof body.v2_enabled === "boolean") setSetting(database, "v2_enabled", body.v2_enabled);
+    if (typeof body.v1_enabled === "boolean") {
+      const v1 = body.v1_enabled;
+      pendingMutations.push(() => setSetting(database, "v1_enabled", v1));
+    }
+    if (typeof body.v2_enabled === "boolean") {
+      const v2 = body.v2_enabled;
+      pendingMutations.push(() => setSetting(database, "v2_enabled", v2));
+    }
 
-    audit(database, "settings.update", { actor: c.get("admin").username, details: { keys: Object.keys(body) } });
+    // Phase 2: Commit all setting/secret mutations and audit log atomically
+    try {
+      withTransaction(database, () => {
+        for (const mutateSetting of pendingMutations) mutateSetting();
+        audit(database, "settings.update", {
+          actor: c.get("admin").username,
+          ip: clientIp(c.req.raw.headers, c.req.raw),
+          details: { keys: Object.keys(body) },
+        });
+      });
+    } catch (error) {
+      clearSecretCache(database);
+      throw error;
+    }
     return c.json({ ok: true, settings: getPublicSettings(database) });
   });
 
@@ -505,8 +650,8 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
         assert(getSecret(database, "wxpay_hook_token"), 400, "WXPAY_HOOK_TOKEN_MISSING", "PC Hook 模式尚未配置鉴权 Token");
         return c.json({ ok: true, message: "PC 微信 Hook 模式已就绪（收款码及 Token 已配置）" });
       }
-      wechatService.getCredentials();
-      return c.json({ ok: true, message: "微信支付证书及 API 密钥验证通过" });
+      wechatService.getCredentials({ requireCallbackKeys: true });
+      return c.json({ ok: true, message: "微信支付证书、32 位 APIv3 密钥及平台公钥验证通过" });
     } catch (err: unknown) {
       return c.json({ ok: false, message: err instanceof Error ? err.message : String(err) }, 400);
     }
@@ -541,22 +686,45 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
 
   app.put("/keys/wxpay/secrets", async (c) => {
     const body = await c.req.json<{ private_key?: string; api_v3_key?: string; hook_token?: string }>();
+    let normalizedPrivateKey: string | undefined;
+    let normalizedApiV3Key: string | undefined;
+    let normalizedHookToken: string | undefined;
+
     if (body.private_key !== undefined) {
-      if (body.private_key) validatePrivateKey(body.private_key);
-      setSecret(database, "wxpay_private_key", body.private_key ? toPkcs8PrivateKey(body.private_key) : "");
+      assert(typeof body.private_key === "string", 400, "INVALID_PRIVATE_KEY", "商户私钥格式无效");
+      if (body.private_key.trim()) {
+        validatePrivateKey(body.private_key);
+        normalizedPrivateKey = toPkcs8PrivateKey(body.private_key);
+      } else {
+        normalizedPrivateKey = "";
+      }
     }
     if (body.api_v3_key !== undefined) {
-      if (body.api_v3_key) {
-        assert(body.api_v3_key.length === 32, 400, "INVALID_V3_KEY", "APIv3 Key 必须为 32 位字符串");
+      assert(typeof body.api_v3_key === "string", 400, "INVALID_V3_KEY", "APIv3 Key 格式无效");
+      const trimmedV3 = body.api_v3_key.trim();
+      if (trimmedV3) {
+        assert(trimmedV3.length === 32, 400, "INVALID_V3_KEY", "APIv3 Key 必须为 32 位字符串");
       }
-      setSecret(database, "wxpay_api_v3_key", body.api_v3_key.trim());
+      normalizedApiV3Key = trimmedV3;
     }
     if (body.hook_token !== undefined) {
+      assert(typeof body.hook_token === "string", 400, "INVALID_HOOK_TOKEN", "Hook 鉴权 Token 格式无效");
       const trimmedToken = body.hook_token.trim();
       assert(trimmedToken.length >= 8, 400, "INVALID_HOOK_TOKEN", "Hook 鉴权 Token 长度至少为 8 位且不能为空");
-      setSecret(database, "wxpay_hook_token", trimmedToken);
+      normalizedHookToken = trimmedToken;
     }
-    audit(database, "keys.wxpay_secrets", { actor: c.get("admin").username, ip: clientIp(c.req.raw.headers, c.req.raw) });
+
+    try {
+      withTransaction(database, () => {
+        if (normalizedPrivateKey !== undefined) setSecret(database, "wxpay_private_key", normalizedPrivateKey);
+        if (normalizedApiV3Key !== undefined) setSecret(database, "wxpay_api_v3_key", normalizedApiV3Key);
+        if (normalizedHookToken !== undefined) setSecret(database, "wxpay_hook_token", normalizedHookToken);
+        audit(database, "keys.wxpay_secrets", { actor: c.get("admin").username, ip: clientIp(c.req.raw.headers, c.req.raw) });
+      });
+    } catch (error) {
+      clearSecretCache(database);
+      throw error;
+    }
     return c.json({ ok: true });
   });
 
@@ -602,12 +770,21 @@ export function createAdminRoutes(database: AppDatabase, scanner: PaymentScanner
   });
 
   const handlePasswordChange = async (c: Context<{ Variables: AuthVariables }>) => {
-    const body = ((await c.req.json().catch(() => ({}))) ?? {}) as { current_password?: string; new_password?: string };
-    assert(body.current_password && body.new_password, 400, "PASSWORDS_REQUIRED", "必须填写当前密码与新密码");
-    assert(body.new_password.length >= 12, 400, "PASSWORD_TOO_SHORT", "新密码至少 12 位");
+    const rawBody = await c.req.json().catch(() => ({}));
+    const parsed = passwordChangeSchema.safeParse(rawBody);
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      const code = issue?.path[0] === "new_password" && issue.code === "too_small"
+        ? "PASSWORD_TOO_SHORT"
+        : issue?.path[0] === "new_password" && issue.code === "too_big"
+          ? "PASSWORD_TOO_LONG"
+          : "PASSWORDS_REQUIRED";
+      throw new AppError(400, code, issue?.message ?? "密码参数格式无效");
+    }
+    const { current_password, new_password } = parsed.data;
     const user = database.query("SELECT * FROM admin_users WHERE id = ?").get(c.get("admin").id) as { password_hash: string } | null;
-    assert(user && (await verifyPassword(body.current_password, user.password_hash)), 400, "CURRENT_PASSWORD_INCORRECT", "当前密码不正确");
-    const newHash = await createPasswordHash(body.new_password);
+    assert(user && (await verifyPassword(current_password, user.password_hash)), 400, "CURRENT_PASSWORD_INCORRECT", "当前密码不正确");
+    const newHash = await createPasswordHash(new_password);
     database.query("UPDATE admin_users SET password_hash = ?, updated_at = ? WHERE id = ?").run(newHash, new Date().toISOString(), c.get("admin").id);
     const currentToken = getCookie(c, SESSION_COOKIE) ?? getCookie(c, "alimpay_session") ?? "";
     if (currentToken) {

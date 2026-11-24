@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 
@@ -13,6 +13,9 @@ export interface RuntimeEnv {
   allowPrivateCallbacks: boolean;
   allowedCallbackHosts: string[];
   trustProxy: boolean;
+  trustedProxyCidrs: string[];
+  trustCloudflare: boolean;
+  setupToken: string;
   masterKey: Buffer;
 }
 
@@ -46,6 +49,43 @@ function loadMasterKey(dataDir: string) {
   return Buffer.from(generated, "base64");
 }
 
+function loadSetupToken(dataDir: string, nodeEnv: RuntimeEnv["nodeEnv"]) {
+  const fromEnv = process.env.SETUP_TOKEN?.trim();
+  if (fromEnv) return fromEnv;
+  if (nodeEnv !== "production") return "";
+
+  const tokenPath = resolve(dataDir, ".setup-token");
+  if (existsSync(tokenPath)) return readFileSync(tokenPath, "utf8").trim();
+
+  const generated = randomBytes(24).toString("base64url");
+  try {
+    writeFileSync(tokenPath, `${generated}\n`, { flag: "wx", mode: 0o600 });
+    console.info(JSON.stringify({
+      level: "info",
+      event: "setup_token_created",
+      token_file: tokenPath,
+      message: "已生成首次安装安全令牌文件，请查看该文件内容或配置 SETUP_TOKEN 环境变量完成初始化",
+    }));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      return readFileSync(tokenPath, "utf8").trim();
+    }
+    throw error;
+  }
+  return generated;
+}
+
+export function consumeSetupToken(dataDir = getRuntimeEnv().dataDir) {
+  try {
+    rmSync(resolve(dataDir, ".setup-token"), { force: true });
+  } catch {
+    // Ignore cleanup errors
+  }
+  if (cached && !process.env.SETUP_TOKEN?.trim()) {
+    cached.setupToken = "";
+  }
+}
+
 let cached: RuntimeEnv | undefined;
 
 export function getRuntimeEnv(): RuntimeEnv {
@@ -55,7 +95,17 @@ export function getRuntimeEnv(): RuntimeEnv {
   const port = Number.parseInt(process.env.PORT ?? "3000", 10);
   const dataDir = resolve(process.env.DATA_DIR ?? "./data");
   const uploadDir = resolve(dataDir, "uploads");
-  mkdirSync(uploadDir, { recursive: true });
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  mkdirSync(uploadDir, { recursive: true, mode: 0o700 });
+  try {
+    chmodSync(dataDir, 0o700);
+    chmodSync(uploadDir, 0o700);
+  } catch {
+    // Ignore permission errors on non-POSIX or restricted filesystems
+  }
+
+  const rawPublicUrl = process.env.PUBLIC_BASE_URL?.trim();
+  const defaultPublicUrl = nodeEnv === "production" ? "" : `http://localhost:${Number.isFinite(port) ? port : 3000}`;
 
   cached = {
     nodeEnv,
@@ -68,13 +118,19 @@ export function getRuntimeEnv(): RuntimeEnv {
         ? resolve(dataDir, "alimpay.sqlite")
         : resolve(dataDir, "apuspay.sqlite"),
     uploadDir,
-    publicBaseUrl: (process.env.PUBLIC_BASE_URL ?? `http://localhost:${Number.isFinite(port) ? port : 3000}`).replace(/\/$/, ""),
+    publicBaseUrl: (rawPublicUrl || defaultPublicUrl).replace(/\/$/, ""),
     allowPrivateCallbacks: boolEnv(process.env.ALLOW_PRIVATE_CALLBACKS),
     allowedCallbackHosts: (process.env.ALLOWED_CALLBACK_HOSTS ?? "")
       .split(",")
       .map((item) => item.trim().toLowerCase())
       .filter(Boolean),
     trustProxy: boolEnv(process.env.TRUST_PROXY),
+    trustedProxyCidrs: (process.env.TRUSTED_PROXY_CIDRS ?? "")
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean),
+    trustCloudflare: boolEnv(process.env.TRUST_CLOUDFLARE),
+    setupToken: loadSetupToken(dataDir, nodeEnv),
     masterKey: loadMasterKey(dataDir),
   };
   return cached;

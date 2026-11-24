@@ -330,5 +330,96 @@ describe("PC WeChat Hook contract", () => {
     );
     expect(ordersRes.status).toBe(200);
     expect((await ordersRes.json() as { code: number }).code).toBe(1);
+
+    // 6. Unmatched Hook event_id is recorded so later replay cannot pay a subsequent order
+    const unmatchedHook = await app.request("http://localhost/api/hook/receive", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-hook-token": "test-secret-token" },
+      body: JSON.stringify({ type: "wechat", money: "12.34", event_id: "gh_f0a92aa7146c:9001" }),
+    });
+    expect(unmatchedHook.status).toBe(200);
+    expect((await unmatchedHook.json() as { code: number }).code).toBe(0);
+
+    setSetting(database, "wxpay_mode", "hook");
+    setSetting(database, "wxpay_static_qr_url", "http://localhost/uploads/wechat-qr-test.png");
+    const { order: futureWxOrder } = await createOrder(database, {
+      pid: "1000000001",
+      apiVersion: "v1",
+      type: "wxpay",
+      outTradeNo: "FUTURE-WX-1",
+      name: "Future wx item",
+      money: "12.34",
+      notifyUrl: "https://8.8.8.8/notify",
+    });
+    const replayedUnmatched = await app.request("http://localhost/api/hook/receive", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-hook-token": "test-secret-token" },
+      body: JSON.stringify({ type: "wechat", money: "12.34", event_id: "gh_f0a92aa7146c:9001" }),
+    });
+    expect(replayedUnmatched.status).toBe(200);
+    expect((await replayedUnmatched.json() as { duplicate: boolean }).duplicate).toBe(true);
+    expect(getOrderById(database, futureWxOrder.id)?.status).toBe("pending");
+
+    // 7. Brute-force 429 on unauthenticated requests does NOT block valid X-Hook-Token from the same IP
+    const { attachSocketIp } = await import("../src/server/auth");
+    for (let i = 0; i < 5; i++) {
+      const badReq = new Request("http://localhost/api/hook/receive", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-hook-token": "wrong-token" },
+        body: JSON.stringify({ type: "wechat", money: "12.34" }),
+      });
+      attachSocketIp(badReq, "203.0.113.55");
+      expect((await app.fetch(badReq)).status).toBe(401);
+    }
+    const sixthBad = new Request("http://localhost/api/hook/receive", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-hook-token": "wrong-token" },
+      body: JSON.stringify({ type: "wechat", money: "12.34" }),
+    });
+    attachSocketIp(sixthBad, "203.0.113.55");
+    expect((await app.fetch(sixthBad)).status).toBe(429);
+
+    const legitDuringLockout = new Request("http://localhost/api/hook/receive", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-hook-token": "test-secret-token" },
+      body: JSON.stringify({ type: "wechat", money: "12.34", event_id: "gh_f0a92aa7146c:9002" }),
+    });
+    attachSocketIp(legitDuringLockout, "203.0.113.55");
+    const legitRes = await app.fetch(legitDuringLockout);
+    expect(legitRes.status).toBe(200);
+    expect((await legitRes.json() as { code: number }).code).toBe(1);
+    expect(getOrderById(database, futureWxOrder.id)?.status).toBe("paid");
+
+    // 8. Merchant PID isolation & V1 key masking & checkout token log redaction
+    await createOrder(database, {
+      pid: "9999999999",
+      apiVersion: "v1",
+      type: "alipay",
+      outTradeNo: "OTHER-PID-ORDER",
+      name: "Other merchant item",
+      money: "15.00",
+      notifyUrl: "https://8.8.8.8/notify",
+    });
+    const filteredList = await (await app.request(
+      "http://localhost/api.php?act=orders&pid=1000000001&key=1234567890abcdef1234567890abcdef",
+    )).json() as { data: Array<{ out_trade_no: string }> };
+    expect(filteredList.data.some((o) => o.out_trade_no === "OTHER-PID-ORDER")).toBe(false);
+
+    const merchantQuery = await (await app.request(
+      "http://localhost/api.php?act=query&pid=1000000001&key=1234567890abcdef1234567890abcdef",
+    )).json() as { key: string };
+    expect(merchantQuery.key).not.toBe("1234567890abcdef1234567890abcdef");
+    expect(merchantQuery.key).toContain("••••");
+
+    const capturedLogs: string[] = [];
+    const origLog = console.log;
+    console.log = (...args: unknown[]) => { capturedLogs.push(args.map(String).join(" ")); };
+    try {
+      await app.request("http://localhost/checkout/secret-checkout-capability-token-xyz");
+    } finally {
+      console.log = origLog;
+    }
+    expect(capturedLogs.some((line) => line.includes("secret-checkout-capability-token-xyz"))).toBe(false);
+    expect(capturedLogs.some((line) => line.includes("/checkout/[REDACTED]"))).toBe(true);
   });
 });

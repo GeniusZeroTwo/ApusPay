@@ -5,6 +5,7 @@ import {
   encryptSecret,
   generateRsaKeyPair,
   generateRsaKeyPairAsync,
+  ipMatchesCidr,
   isAllowedCallbackHost,
   isPrivateAddress,
   md5Sign,
@@ -114,6 +115,10 @@ describe("secret and input security", () => {
     expect(parseBoundedInt("abc", 20, 1, 50)).toBe(20);
     expect(parseBoundedInt("-5", 20, 1, 50)).toBe(1);
     expect(parseBoundedInt("999", 20, 1, 50)).toBe(50);
+    expect(ipMatchesCidr("172.18.0.5", "172.16.0.0/12")).toBe(true);
+    expect(ipMatchesCidr("203.0.113.5", "172.16.0.0/12")).toBe(false);
+    expect(ipMatchesCidr("::ffff:127.0.0.1", "127.0.0.0/8")).toBe(true);
+    expect(ipMatchesCidr("fd12:3456::1", "fc00::/7")).toBe(true);
     expect(() => validateCallbackUrl("file:///etc/passwd", false)).toThrow();
     expect(() => validateCallbackUrl("http://example.com:22/callback", false)).toThrow();
     expect(() => validateCallbackUrl("http://example.com:6379/callback", false)).toThrow();
